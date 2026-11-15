@@ -42,7 +42,11 @@ component ChatTurnView inherits VerticalLayout {
 component Transcript inherits Rectangle {
     in property <[ChatTurn]> turns;
     in property <int> scroll-tick;
+    // Bumped when the user commits a new prompt: re-pin even if they had scrolled up.
+    in property <int> stick-tick;
 
+    // `pinned` is the user's intent, not the scroll position: it stays false once they
+    // scroll away from the bottom, so streaming text never yanks the view.
     property <bool> pinned: true;
     property <bool> scroll-pending: false;
     background: transparent;
@@ -77,6 +81,11 @@ component Transcript inherits Rectangle {
         root.scroll-pending = true;
     }
 
+    changed stick-tick => {
+        root.pinned = true;
+        root.scroll-pending = true;
+    }
+
     Timer {
         interval: 16ms;
         running: root.scroll-pending;
@@ -92,14 +101,20 @@ component Transcript inherits Rectangle {
 export component ChatWorkspace inherits VerticalLayout {
     in property <[ChatTurn]> turns;
     in property <int> scroll-tick;
+    in property <int> stick-tick;
     in property <string> model-indicator;
     in property <string> endpoint-name;
     in property <string> empty-engine;
     in property <bool> model-loaded;
     in property <bool> busy;
+    in property <string> phase;
+    in property <bool> send-ready;
+    in property <string> composer-note;
+    in property <int> composer-focus-tick;
     in property <bool> awaiting-tool-approval;
     in property <string> pending-tool-title;
     in property <string> pending-tool-args;
+    in property <string> pending-tool-progress;
     in-out property <string> input-text;
 
     callback send-requested();
@@ -110,6 +125,17 @@ export component ChatWorkspace inherits VerticalLayout {
     spacing: 8px;
     horizontal-stretch: 1;
     vertical-stretch: 1;
+
+    // Focus the composer as soon as the workspace exists, and again whenever the
+    // controller asks (launch, Ctrl+L, New conversation). Keystrokes typed into the
+    // sidebar fields are never stolen because each request is an explicit increment.
+    init => {
+        composer-input.focus();
+    }
+
+    changed composer-focus-tick => {
+        composer-input.focus();
+    }
 
     HorizontalLayout {
         height: 18px;
@@ -210,6 +236,7 @@ export component ChatWorkspace inherits VerticalLayout {
             visible: root.turns.length > 0;
             turns: root.turns;
             scroll-tick: root.scroll-tick;
+            stick-tick: root.stick-tick;
         }
     }
 
@@ -227,12 +254,24 @@ export component ChatWorkspace inherits VerticalLayout {
             VerticalLayout {
                 spacing: 4px;
                 horizontal-stretch: 1;
-                Text {
-                    text: root.pending-tool-title;
-                    font-size: 12px;
-                    font-weight: 500;
-                    color: Ui.text;
-                    overflow: elide;
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Text {
+                        text: root.pending-tool-title;
+                        font-size: 12px;
+                        font-weight: 500;
+                        color: Ui.text;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: root.pending-tool-progress;
+                        font-size: 11px;
+                        font-family: Ui.font-mono;
+                        color: Ui.muted;
+                        vertical-alignment: center;
+                    }
                 }
                 Text {
                     text: root.pending-tool-args;
@@ -241,6 +280,11 @@ export component ChatWorkspace inherits VerticalLayout {
                     color: Ui.muted;
                     overflow: elide;
                 }
+                Text {
+                    text: "Esc declines every pending call.";
+                    font-size: 11px;
+                    color: Ui.muted;
+                }
             }
 
             HorizontalLayout {
@@ -248,7 +292,7 @@ export component ChatWorkspace inherits VerticalLayout {
                 alignment: end;
 
                 FlatButton {
-                    label: "Decline";
+                    label: "Decline (Esc)";
                     height: 32px;
                     clicked => { root.decline-tool-requested(); }
                 }
@@ -269,6 +313,8 @@ export component ChatWorkspace inherits VerticalLayout {
         border-width: 1px;
         border-color: composer-input.has-focus ? Ui.accent : Ui.hairline;
 
+        // Stays enabled while a generation runs: the prompt can be typed ahead, it just
+        // cannot be sent until the run finishes (see the gate note below).
         composer-input := TextInput {
             x: 14px;
             y: 10px;
@@ -280,7 +326,6 @@ export component ChatWorkspace inherits VerticalLayout {
             font-size: 14px;
             font-family: Ui.font-sans;
             color: Ui.text;
-            enabled: !root.busy;
             selection-background-color: Ui.accent;
             selection-foreground-color: #FFFFFF;
             key-pressed(event) => {
@@ -312,15 +357,22 @@ export component ChatWorkspace inherits VerticalLayout {
             alignment: end;
 
             Text {
-                text: "Enter sends \u{00B7} Shift+Enter new line";
+                text: root.composer-note;
+                font-size: 11px;
+                color: Ui.text;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: "Enter sends \u{00B7} Shift+Enter newline \u{00B7} Esc stops \u{00B7} Ctrl+N new \u{00B7} Ctrl+L focus";
                 font-size: 11px;
                 color: Ui.muted;
                 vertical-alignment: center;
             }
-            Rectangle { horizontal-stretch: 1; background: transparent; }
 
             if root.busy : FlatButton {
-                label: "Stop";
+                label: root.phase == "stopping" ? "Stopping…" : "Stop (Esc)";
                 button-enabled: true;
                 height: 26px;
                 clicked => { root.stop-requested(); }
@@ -328,7 +380,7 @@ export component ChatWorkspace inherits VerticalLayout {
             FlatButton {
                 label: "Send";
                 primary: true;
-                button-enabled: !root.busy;
+                button-enabled: root.send-ready;
                 height: 26px;
                 clicked => { root.send-requested(); }
             }

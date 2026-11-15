@@ -1,7 +1,7 @@
 //! Typed contracts shared by the desktop UI controller and every backend adapter.
 //! Hardware arguments stay backend-specific; transport events stay uniform.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -163,29 +163,44 @@ impl ToolCallRecord {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiFunctionCall {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub arguments: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiToolCall {
+    #[serde(default)]
     pub id: String,
-    #[serde(rename = "type")]
+    #[serde(default = "function_kind", rename = "type")]
     pub kind: String,
+    #[serde(default)]
     pub function: OpenAiFunctionCall,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+fn function_kind() -> String {
+    "function".into()
+}
+
+/// One OpenAI-compatible chat message.
+///
+/// Serde round-trips the exact wire shape, which also makes it the on-disk shape of a
+/// restored conversation (`persist::SESSION_FILE`). Every field is defaulted so a
+/// hand-edited or older file cannot fail the whole parse.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
+    #[serde(default)]
     pub role: String,
+    #[serde(default)]
     pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<OpenAiToolCall>>,
 }
 
