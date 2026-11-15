@@ -45,6 +45,7 @@ export component MainWindow inherits Window {
     in-out property <string> pending-tool-args: "";
 
     in-out property <string> model-label: "local-model";
+    in-out property <string> system-prompt: "You are a helpful, expert AI assistant.";
     in-out property <string> llama-executable: "llama-server";
     in-out property <string> llama-model-path: "";
     in-out property <string> llama-port: "8080";
@@ -81,6 +82,10 @@ export component MainWindow inherits Window {
     callback mcp-disconnect-requested();
     callback approve-tool-requested();
     callback decline-tool-requested();
+    callback export-chat-requested();
+    callback export-json-requested();
+    callback copy-transcript-requested();
+    callback apply-preset(int);
 
     property <bool> image-edition: edition-index == 1;
     property <bool> chat-tab: tab-index == 0;
@@ -140,6 +145,7 @@ export component MainWindow inherits Window {
                     SelectChip {
                         y: (parent.height - self.height) / 2;
                         chip-width: 112px;
+                        chip-enabled: !root.busy;
                         value: root.edition-name;
                         activated => {
                             root.edition-index = root.edition-index == 0 ? 1 : 0;
@@ -162,6 +168,7 @@ export component MainWindow inherits Window {
                     SelectChip {
                         y: (parent.height - self.height) / 2;
                         chip-width: 116px;
+                        chip-enabled: !root.busy;
                         value: root.backend-name;
                         activated => {
                             root.backend-index = root.backend-index == 2 ? 0 : root.backend-index + 1;
@@ -207,6 +214,7 @@ export component MainWindow inherits Window {
                 mcp-status: root.mcp-status;
 
                 model-label <=> root.model-label;
+                system-prompt <=> root.system-prompt;
                 llama-executable <=> root.llama-executable;
                 llama-model-path <=> root.llama-model-path;
                 llama-port <=> root.llama-port;
@@ -232,6 +240,7 @@ export component MainWindow inherits Window {
                 new-chat-requested => { root.new-chat-requested(); }
                 mcp-connect-requested => { root.mcp-connect-requested(); }
                 mcp-disconnect-requested => { root.mcp-disconnect-requested(); }
+                apply-preset(p) => { root.apply-preset(p); }
             }
 
             VerticalLayout {
@@ -247,11 +256,13 @@ export component MainWindow inherits Window {
                     QuietTab {
                         label: "Chat";
                         selected: root.tab-index == 0;
+                        tab-enabled: !root.busy;
                         clicked => { root.tab-index = 0; }
                     }
                     if root.image-edition : QuietTab {
                         label: "Image";
                         selected: root.tab-index == 1;
+                        tab-enabled: !root.busy;
                         clicked => { root.tab-index = 1; }
                     }
                 }
@@ -273,6 +284,10 @@ export component MainWindow inherits Window {
                     stop-requested => { root.stop-requested(); }
                     approve-tool-requested => { root.approve-tool-requested(); }
                     decline-tool-requested => { root.decline-tool-requested(); }
+                    export-chat-requested => { root.export-chat-requested(); }
+                    export-json-requested => { root.export-json-requested(); }
+                    copy-transcript-requested => { root.copy-transcript-requested(); }
+                    clear-chat-requested => { root.new-chat-requested(); }
                 }
 
                 if !root.chat-tab : ImageWorkspace {

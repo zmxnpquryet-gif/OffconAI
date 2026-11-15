@@ -15,6 +15,7 @@ import com.localllm.android.model.ChatMessage
 import com.localllm.android.model.Conversation
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -22,20 +23,24 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Manages conversation selection, unsaved in-memory drafts, pending attachments,
  * and per-conversation Document RAG indexing/selection.
  */
 internal class ConversationController(
-    application: Application,
+    private val application: Application,
     private val scope: CoroutineScope,
     val repository: ChatRepository,
     private val strings: LocalizedStringProvider,
     private val activeModelId: () -> String,
     private val languagePreference: () -> String,
     private val onStopGeneration: () -> Unit,
+    private val onCancelAndJoinTurn: suspend () -> Unit,
     private val postStatus: (String) -> Unit
 ) {
     val conversations: StateFlow<List<Conversation>> = repository.conversations
@@ -49,6 +54,8 @@ internal class ConversationController(
 
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
     val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
+
+    private val historyMutationInProgress = AtomicBoolean(false)
 
     private val _pendingAttachment = MutableStateFlow<ChatAttachment?>(null)
     val pendingAttachment: StateFlow<ChatAttachment?> = _pendingAttachment.asStateFlow()
@@ -134,9 +141,9 @@ internal class ConversationController(
     }
 
     fun deleteConversation(id: String) {
-        onStopGeneration()
-        if (pendingConversation?.id == id) pendingConversation = null
-        scope.launch {
+        launchHistoryMutation {
+            onCancelAndJoinTurn()
+            if (pendingConversation?.id == id) pendingConversation = null
             repository.deleteConversation(id)
             if (_currentConversationId.value == id) {
                 val remaining = conversations.value.filter { it.id != id }
@@ -147,13 +154,73 @@ internal class ConversationController(
     }
 
     fun clearAllHistory() {
-        onStopGeneration()
-        pendingConversation = null
-        scope.launch {
+        launchHistoryMutation {
+            onCancelAndJoinTurn()
+            pendingConversation = null
             repository.clearAll()
             _messages.value = emptyList()
             _currentConversationId.value = null
             createNewConversation()
+        }
+    }
+
+    fun isHistoryMutationInProgress(): Boolean = historyMutationInProgress.get()
+
+    private fun launchHistoryMutation(action: suspend () -> Unit) {
+        if (!historyMutationInProgress.compareAndSet(false, true)) {
+            postStatus(strings.get(R.string.vm_status_history_mutation_in_progress))
+            return
+        }
+        scope.launch {
+            try {
+                action()
+            } finally {
+                historyMutationInProgress.set(false)
+            }
+        }
+    }
+
+    fun exportToUri(
+        uri: Uri,
+        format: String,
+        streamingMessage: ChatMessage?,
+        onComplete: (Result<Unit>) -> Unit
+    ) {
+        val currentConv = conversations.value.firstOrNull { it.id == _currentConversationId.value }
+            ?: pendingConversation
+        val title = currentConv?.title.orEmpty()
+        val modelId = currentConv?.modelId?.takeIf { it.isNotBlank() } ?: activeModelId()
+        val convId = _currentConversationId.value.orEmpty()
+        val messages = _messages.value
+            .filterNot { it.id == streamingMessage?.id }
+            .toMutableList()
+        streamingMessage?.let { messages += it.copy(isStreaming = false, isReasoningStreaming = false) }
+        val exportJson = format.equals("json", ignoreCase = true)
+
+        scope.launch {
+            val result = try {
+                withContext(Dispatchers.IO) {
+                    val content = if (exportJson) {
+                        ConversationExporter.formatJson(convId, title, modelId, messages)
+                    } else {
+                        ConversationExporter.formatMarkdown(title, modelId, messages)
+                    }
+                    val output = application.contentResolver.openOutputStream(uri, "w")
+                        ?: throw IOException(application.getString(R.string.chat_export_write_failed))
+                    output.bufferedWriter(Charsets.UTF_8).use { writer -> writer.write(content) }
+                }
+                Result.success(Unit)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                val message = if (failure is SecurityException || failure is java.io.FileNotFoundException) {
+                    application.getString(R.string.chat_export_storage_failed)
+                } else {
+                    application.getString(R.string.chat_export_write_failed)
+                }
+                Result.failure(IOException(message, failure))
+            }
+            onComplete(result)
         }
     }
 

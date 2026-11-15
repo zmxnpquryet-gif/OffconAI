@@ -172,6 +172,7 @@
     <string name="vm_desc_token_applied">인증 토큰 적용</string>
     <string name="vm_desc_custom_model">커스텀 모델 (%1$s)</string>
     <string name="vm_status_message_too_long">메시지가 너무 깁니다 (최대 %1$d자). 앞부분만 전송됩니다.</string>
+    <string name="vm_status_history_mutation_in_progress">대화 기록을 변경 중입니다. 완료된 뒤 메시지를 보내 주세요.</string>
     <string name="vm_conversation_photo_title">사진 대화</string>
     <string name="vm_notice_no_model">다운로드된 모델이 없습니다. 상단 메뉴 또는 모델 관리에서 모델을 먼저 다운로드해 주세요.</string>
     <string name="vm_status_loading_memory">%1$s 메모리 로드 중…</string>
@@ -237,6 +238,15 @@
     <string name="chat_rename_title">대화 제목 변경</string>
     <string name="chat_rename_label">대화 제목</string>
     <string name="chat_rename_confirm">변경</string>
+    <string name="chat_export_md">Markdown 내보내기 (.md)</string>
+    <string name="chat_export_json">JSON 내보내기 (.json)</string>
+    <string name="chat_export_success">%1$s 저장됨. 공유할 앱을 선택하거나 파일 앱에서 선택한 폴더를 확인하세요.</string>
+    <string name="chat_export_failed">내보내기 실패: %1$s</string>
+    <string name="chat_export_empty">내보낼 메시지가 없습니다</string>
+    <string name="chat_export_saving">대화 내보내는 중…</string>
+    <string name="chat_export_share_title">대화 내보내기 공유</string>
+    <string name="chat_export_storage_failed">선택한 위치에 접근할 수 없습니다. 다른 폴더를 선택해 다시 시도하세요.</string>
+    <string name="chat_export_write_failed">내보낸 파일을 기록하지 못했습니다. 저장 공간과 접근 권한을 확인하고 다시 시도하세요.</string>
 
     <!-- API Server screen -->
     <string name="api_refresh_ip_desc">IP 주소 새로고침</string>
@@ -656,4 +666,35 @@
     <string name="chat_empty_suggest_api">로컬 API 연결 방법 알려줘</string>
     <string name="chat_empty_footer">계정 없음 · 텔레메트리 없음 · 오프라인 추론</string>
     <string name="chat_input_hint">메시지</string>
+    <string name="chat_attachment_image">이미지</string>
+    <string name="chat_attachment_file">파일</string>
+    <string name="chat_attachment_remove">첨부 삭제</string>
+    <string name="chat_status_prefill">프롬프트 처리 중 · %1$s tok/s</string>
+    <string name="chat_status_generating">생성 중…</string>
+    <string name="chat_status_metrics">%1$s tok/s · %2$d ctx</string>
+    <string name="chat_status_loading_progress">%1$s · %2$d%%</string>
+    <string name="chat_status_preparing_image">이미지 입력 준비 중…</string>
+    <string name="chat_state_ready_to_send">보낼 준비됨</string>
+    <string name="chat_state_streaming">응답 생성 중 · 누르면 중지</string>
+    <string name="chat_send_disabled_hint">메시지를 입력하거나 파일을 첨부하면 보낼 수 있습니다</string>
+    <string name="chat_reasoning_effort_with_value">%1$s (%2$s)</string>
+    <string name="chat_state_expanded">펼쳐짐</string>
+    <string name="chat_state_collapsed">접힘</string>
+    <string name="chat_attach_opening">선택기를 여는 중…</string>
+    <string name="chat_picker_unavailable">파일 선택기를 열 수 없습니다. 다시 시도하세요.</string>
+    <string name="chat_library_empty">라이브러리에 문서가 없습니다. PDF, XLSX, PPTX 또는 텍스트 파일을 첨부하면 이 대화에서 검색할 수 있습니다.</string>
+    <string name="voice_mode_header_native">%1$s · 네이티브 오디오 입력 → 음성 출력 · 턴마다 한 번 탭</string>
+    <string name="voice_native_model_fallback">네이티브 오디오 모델</string>
+    <string name="voice_native_session_title">네이티브 오디오 세션</string>
+    <string name="voice_native_session_desc">마이크 오디오(16 kHz PCM)가 모델로 직접 전달되고 답변 텍스트와 음성이 함께 도착합니다.</string>
+    <string name="voice_state_muted">마이크가 음소거되었습니다. 음소거를 해제해 음성 대화를 계속하세요.</string>
+    <string name="voice_status_label_idle">대기</string>
+    <string name="voice_status_label_listening">듣는 중</string>
+    <string name="voice_status_label_thinking">생각 중</string>
+    <string name="voice_status_label_speaking">말하는 중</string>
+    <string name="voice_status_label_muted">음소거</string>
+    <string name="voice_mic_mute">마이크 음소거</string>
+    <string name="voice_mic_unmute">마이크 음소거 해제</string>
+    <string name="voice_stop_dictation">음성 입력 중지</string>
+    <string name="voice_tts_speaker_item">화자 %1$d</string>
 </resources>

@@ -11,7 +11,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
@@ -25,6 +25,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 
 /** Primary glass button. */
@@ -47,9 +48,15 @@ fun GButton(
             .alpha(if (enabled) 1f else 0.45f)
             .clip(RoundedCornerShape(12.dp))
             .background(bg.copy(alpha = if (pressed) 0.86f else 1f))
-            .clickable(interactionSource = interaction, indication = null, enabled = enabled, onClick = onClick)
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                enabled = enabled,
+                role = Role.Button,
+                onClick = onClick
+            )
             .padding(horizontal = 18.dp, vertical = 10.dp)
-            .defaultMinSize(minHeight = 44.dp),
+            .defaultMinSize(minHeight = 48.dp),
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
         content = {
@@ -76,7 +83,13 @@ fun GOutlineButton(
             .clip(RoundedCornerShape(12.dp))
             .background(if (pressed) GlassTheme.colors.surfaceVariant else GlassTheme.colors.surface)
             .border(1.dp, GlassTheme.colors.outline, RoundedCornerShape(12.dp))
-            .clickable(interactionSource = interaction, indication = null, enabled = enabled, onClick = onClick)
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                enabled = enabled,
+                role = Role.Button,
+                onClick = onClick
+            )
             .padding(horizontal = 16.dp, vertical = 10.dp),
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
@@ -96,7 +109,7 @@ fun GTextButton(
         modifier = modifier
             .alpha(if (enabled) 1f else 0.45f)
             .clip(RoundedCornerShape(10.dp))
-            .clickable(enabled = enabled, onClick = onClick)
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 8.dp),
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
@@ -112,12 +125,34 @@ fun GIconButton(
     enabled: Boolean = true,
     content: @Composable () -> Unit
 ) {
+    GCompactIconButton(
+        onClick = onClick,
+        modifier = modifier,
+        enabled = enabled,
+        content = content
+    )
+}
+
+/**
+ * Icon button with a compact visual but a minimum 48dp touch target.
+ *
+ * The minimum is applied before [modifier], so a caller's fixed smaller size is
+ * constrained up to 48dp instead of shrinking the clickable area.
+ */
+@Composable
+fun GCompactIconButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    content: @Composable () -> Unit
+) {
     Box(
-        modifier = modifier
+        modifier = Modifier
+            .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+            .then(modifier)
             .alpha(if (enabled) 1f else 0.4f)
-            .size(48.dp)
             .clip(CircleShape)
-            .clickable(enabled = enabled, onClick = onClick),
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick),
         contentAlignment = Alignment.Center,
         content = { content() }
     )

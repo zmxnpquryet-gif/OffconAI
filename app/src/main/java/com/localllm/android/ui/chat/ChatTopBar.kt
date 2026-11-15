@@ -53,6 +53,8 @@ fun ChatTopBar(
     onSwitchRuntime: (ModelRuntimeType) -> Unit,
     onOpenModelManager: () -> Unit = {},
     onOpenApiMode: () -> Unit = {},
+    onExportMarkdown: () -> Unit = {},
+    onExportJson: () -> Unit = {},
     contextUsageTokens: Int = 0,
     modifier: Modifier = Modifier
 ) {
@@ -295,6 +297,28 @@ fun ChatTopBar(
                     expanded = isMoreMenuExpanded,
                     onDismissRequest = { isMoreMenuExpanded = false }
                 ) {
+                    GMenuItem(
+                        text = { GText(stringResource(R.string.chat_export_md)) },
+                        leadingIcon = {
+                            GIcon(GIcons.Description, contentDescription = null, tint = GlassTheme.colors.primary)
+                        },
+                        onClick = {
+                            isMoreMenuExpanded = false
+                            onExportMarkdown()
+                        }
+                    )
+
+                    GMenuItem(
+                        text = { GText(stringResource(R.string.chat_export_json)) },
+                        leadingIcon = {
+                            GIcon(GIcons.Description, contentDescription = null, tint = GlassTheme.colors.primary)
+                        },
+                        onClick = {
+                            isMoreMenuExpanded = false
+                            onExportJson()
+                        }
+                    )
+
                     GMenuItem(
                         text = {
                             GText(stringResource(R.string.nav_models))

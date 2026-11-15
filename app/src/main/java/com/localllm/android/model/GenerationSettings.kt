@@ -1,6 +1,5 @@
 package com.localllm.android.model
 
-import com.localllm.android.R
 import com.localllm.android.i18n.AppStrings
 
 data class GenerationSettings(
@@ -46,10 +45,5 @@ data class GenerationSettings(
         get() = apiServerBindAddress == "0.0.0.0"
 
     val reasoningEffortLabel: String
-        get() = when {
-            reasoningEffort <= 0.25f -> AppStrings.get(R.string.gen_effort_low)
-            reasoningEffort <= 0.6f -> AppStrings.get(R.string.gen_effort_medium)
-            reasoningEffort <= 0.85f -> AppStrings.get(R.string.gen_effort_high)
-            else -> AppStrings.get(R.string.gen_effort_max)
-        }
+        get() = AppStrings.get(ReasoningEffortTier.of(reasoningEffort).labelRes)
 }

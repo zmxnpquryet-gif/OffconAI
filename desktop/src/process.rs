@@ -2,6 +2,7 @@
 
 use crate::contracts::ResourceSnapshot;
 use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -53,6 +54,7 @@ impl ProcessSlot {
         stop_child(child);
         *self.started_at.lock().expect("started lock") = None;
         *self.loaded_model.lock().expect("model lock") = None;
+        *self.log_file.lock().expect("log lock") = None;
     }
 
     pub fn alive(&self) -> bool {
@@ -60,6 +62,21 @@ impl ProcessSlot {
         match guard.as_mut() {
             Some(child) => matches!(child.try_wait(), Ok(None)),
             None => false,
+        }
+    }
+
+    /// Whether this slot owns a child process, including one that has already exited.
+    /// `pid()` intentionally returns `None` for an exited child, so it cannot be used
+    /// to distinguish a dead managed process from an external endpoint.
+    pub fn has_child_process(&self) -> bool {
+        self.child.lock().expect("process lock").is_some()
+    }
+
+    pub fn exit_status(&self) -> Option<std::process::ExitStatus> {
+        let mut guard = self.child.lock().expect("process lock");
+        match guard.as_mut() {
+            Some(child) => child.try_wait().ok().flatten(),
+            None => None,
         }
     }
 
@@ -130,8 +147,27 @@ fn stop_child(child: Option<Child>) {
     if matches!(child.try_wait(), Ok(Some(_))) {
         return;
     }
+    let pid = child.id();
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .output();
+    }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+pub fn sanitize_path(input: &str) -> String {
+    let trimmed = input.trim();
+    if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        if trimmed.len() >= 2 {
+            return trimmed[1..trimmed.len() - 1].trim().to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 pub fn log_path(name: &str) -> PathBuf {
@@ -165,15 +201,40 @@ pub fn log_tail(path: Option<&Path>, lines: usize) -> String {
     let Some(path) = path else {
         return String::new();
     };
-    let Ok(text) = fs::read_to_string(path) else {
-        return String::new();
-    };
-    let all: Vec<&str> = text.lines().collect();
-    if all.is_empty() {
+    if lines == 0 {
         return String::new();
     }
-    let from = all.len().saturating_sub(lines);
-    format!("Log tail: {}", all[from..].join(" | "))
+
+    const MAX_TAIL_BYTES: u64 = 256 * 1024;
+    let Ok(mut file) = File::open(path) else {
+        return String::new();
+    };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return String::new();
+    };
+    let start = length.saturating_sub(MAX_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::with_capacity(length.saturating_sub(start) as usize);
+    if file.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+
+    let text = String::from_utf8_lossy(&bytes);
+    let tail = if start > 0 {
+        text.find('\n')
+            .map(|newline| &text[newline + 1..])
+            .unwrap_or(text.as_ref())
+    } else {
+        text.as_ref()
+    };
+    let mut recent: Vec<&str> = tail.lines().rev().take(lines).collect();
+    if recent.is_empty() {
+        return String::new();
+    }
+    recent.reverse();
+    format!("Log tail: {}", recent.join(" | "))
 }
 
 pub fn wait_for(timeout: Duration, mut probe: impl FnMut() -> bool) -> bool {
@@ -182,9 +243,43 @@ pub fn wait_for(timeout: Duration, mut probe: impl FnMut() -> bool) -> bool {
         if probe() {
             return true;
         }
-        thread::sleep(Duration::from_millis(400));
+        let remaining = deadline.checked_duration_since(Instant::now()).unwrap_or_default();
+        thread::sleep(remaining.min(Duration::from_millis(150)));
     }
     false
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WaitOutcome {
+    Success,
+    ProcessExited(Option<i32>),
+    TimedOut,
+}
+
+pub fn wait_for_process_health(
+    timeout: Duration,
+    slot: &ProcessSlot,
+    mut is_healthy: impl FnMut() -> bool,
+) -> WaitOutcome {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = slot.exit_status() {
+            return WaitOutcome::ProcessExited(status.code());
+        }
+        if is_healthy() {
+            // A different server may answer on the same port after our child exits.
+            return match slot.exit_status() {
+                Some(status) => WaitOutcome::ProcessExited(status.code()),
+                None => WaitOutcome::Success,
+            };
+        }
+        if let Some(status) = slot.exit_status() {
+            return WaitOutcome::ProcessExited(status.code());
+        }
+        let remaining = deadline.checked_duration_since(Instant::now()).unwrap_or_default();
+        thread::sleep(remaining.min(Duration::from_millis(150)));
+    }
+    WaitOutcome::TimedOut
 }
 
 pub fn default_threads() -> usize {
@@ -194,7 +289,8 @@ pub fn default_threads() -> usize {
 }
 
 pub fn resolve_executable(executable: &str) -> Option<PathBuf> {
-    let executable = executable.trim();
+    let clean = sanitize_path(executable);
+    let executable = clean.trim();
     if executable.is_empty() {
         return None;
     }
@@ -238,21 +334,49 @@ pub fn resolve_executable(executable: &str) -> Option<PathBuf> {
 pub fn parse_command(input: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut current = String::new();
+    let mut token_started = false;
     let mut quote: Option<char> = None;
-    for character in input.chars() {
+    let mut chars = input.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\\'
+            && quote.is_some_and(|active| {
+                chars
+                    .peek()
+                    .is_some_and(|next| *next == active || *next == '\\')
+            })
+        {
+            if let Some(escaped) = chars.next() {
+                current.push(escaped);
+                token_started = true;
+                continue;
+            }
+        }
         match quote {
-            Some(active) if character == active => quote = None,
-            Some(_) => current.push(character),
-            None if character == '"' || character == '\'' => quote = Some(character),
+            Some(active) if character == active => {
+                quote = None;
+                token_started = true;
+            }
+            Some(_) => {
+                current.push(character);
+                token_started = true;
+            }
+            None if character == '"' || character == '\'' => {
+                quote = Some(character);
+                token_started = true;
+            }
             None if character.is_whitespace() => {
-                if !current.is_empty() {
+                if token_started {
                     result.push(std::mem::take(&mut current));
+                    token_started = false;
                 }
             }
-            None => current.push(character),
+            None => {
+                current.push(character);
+                token_started = true;
+            }
         }
     }
-    if !current.is_empty() {
+    if token_started || quote.is_some() {
         result.push(current);
     }
     result
@@ -398,4 +522,5 @@ mod tests {
         assert_eq!(format_bytes(2 * 1024 * 1024), "2 MiB");
         assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
     }
+
 }

@@ -52,6 +52,7 @@ export component ImageWorkspace inherits VerticalLayout {
                     FieldLabel { text: "Endpoint"; }
                     Field {
                         text <=> root.image-endpoint;
+                        field-label: "Image endpoint";
                         placeholder: "http://127.0.0.1:8000";
                         field-enabled: !root.busy;
                         monospace: true;
@@ -62,6 +63,7 @@ export component ImageWorkspace inherits VerticalLayout {
                     FieldLabel { text: "Image model"; }
                     Field {
                         text <=> root.image-model;
+                        field-label: "Image model";
                         placeholder: "flux-schnell";
                         field-enabled: !root.busy;
                         monospace: true;
@@ -75,6 +77,7 @@ export component ImageWorkspace inherits VerticalLayout {
                         FieldLabel { text: "Size"; }
                         Field {
                             text <=> root.image-size;
+                            field-label: "Image size";
                             placeholder: "1024x1024";
                             field-enabled: !root.busy;
                             monospace: true;
@@ -86,6 +89,7 @@ export component ImageWorkspace inherits VerticalLayout {
                         FieldLabel { text: "Output path"; }
                         Field {
                             text <=> root.image-output;
+                            field-label: "Output path";
                             placeholder: "build/desktop/generated.png";
                             field-enabled: !root.busy;
                             monospace: true;
@@ -113,6 +117,8 @@ export component ImageWorkspace inherits VerticalLayout {
                         enabled: !root.busy;
                         selection-background-color: Ui.accent;
                         selection-foreground-color: #FFFFFF;
+                        accessible-label: "Image prompt";
+                        accessible-placeholder-text: "Describe the still image...";
                     }
                     Text {
                         x: 11px;
@@ -123,12 +129,13 @@ export component ImageWorkspace inherits VerticalLayout {
                         font-size: 13px;
                         color: Ui.muted;
                         vertical-alignment: center;
+                        accessible-role: none;
                     }
                 }
                 FlatButton {
                     label: "Generate image";
                     primary: true;
-                    button-enabled: !root.busy;
+                    button-enabled: !root.busy && root.image-prompt != "";
                     clicked => { root.generate-image-requested(); }
                 }
             }

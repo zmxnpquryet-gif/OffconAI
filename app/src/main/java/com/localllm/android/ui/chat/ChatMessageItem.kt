@@ -265,10 +265,26 @@ fun ChatMessageItem(
     }
 }
 
+private val LEADING_THINK_TAGS = listOf(
+    "</think>", "<think>",
+    "</thought>", "<thought>",
+    "</thinking>", "<thinking>",
+    "<channel|>", "<|channel>thought\n", "<|channel>thought"
+)
+
 /** Hides a stray opening/closing think tag left at the start of a saved answer. */
 private fun String.withoutLeadingThinkTags(): String {
     var text = trimStart()
-    if (text.startsWith("</think>")) text = text.removePrefix("</think>").trimStart()
-    if (text.startsWith("<think>")) text = text.removePrefix("<think>").trimStart()
+    var changed = true
+    while (changed) {
+        changed = false
+        for (tag in LEADING_THINK_TAGS) {
+            if (text.startsWith(tag, ignoreCase = true)) {
+                text = text.substring(tag.length).trimStart()
+                changed = true
+                break
+            }
+        }
+    }
     return text
 }

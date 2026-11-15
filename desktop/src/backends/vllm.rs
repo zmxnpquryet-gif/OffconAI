@@ -4,7 +4,10 @@ use crate::contracts::{
     BackendCapabilities, BackendKind, ChatRequest, LlmBackend, ModelSpec, ResourceSnapshot,
     StreamEvent,
 };
-use crate::process::{log_path, log_tail, spawn_with_log, wait_for, ProcessSlot};
+use crate::process::{
+    log_path, log_tail, sanitize_path, spawn_with_log, wait_for_process_health, ProcessSlot,
+    WaitOutcome,
+};
 use crate::transport::OpenAiTransport;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,6 +81,9 @@ impl LlmBackend for Vllm {
     }
 
     fn load(&self, model: &ModelSpec) -> Result<(), String> {
+        // A load replaces the current managed process even when switching back to
+        // an external endpoint; otherwise changing auto_start leaks the old server.
+        self.unload();
         let served = {
             let explicit = model.effective_served_id();
             if explicit != "local-model" || self.config.model_path.trim().is_empty() {
@@ -88,13 +94,12 @@ impl LlmBackend for Vllm {
         };
 
         if self.config.auto_start {
-            self.unload();
             let python = if self.config.python_executable.trim().is_empty() {
-                "python"
+                "python".to_string()
             } else {
-                self.config.python_executable.trim()
+                sanitize_path(&self.config.python_executable)
             };
-            let model_path = model
+            let raw_model_path = model
                 .local_path
                 .as_deref()
                 .map(str::trim)
@@ -104,13 +109,14 @@ impl LlmBackend for Vllm {
                     (!configured.is_empty()).then_some(configured)
                 })
                 .unwrap_or(&served);
+            let model_path = sanitize_path(raw_model_path);
             if model_path.is_empty() {
                 return Err("vLLM managed start requires a model path or Hugging Face id".into());
             }
             let mut command = Command::new(python);
             command
                 .args(["-m", "vllm.entrypoints.openai.api_server", "--model"])
-                .arg(model_path)
+                .arg(&model_path)
                 .args(["--served-model-name", &served])
                 .args(["--host", "127.0.0.1", "--port"])
                 .arg(self.config.port.to_string())
@@ -126,15 +132,22 @@ impl LlmBackend for Vllm {
             let child = spawn_with_log(command, &log)?;
             self.slot.store_child(child, log.clone());
             self.slot.set_loaded(&served);
-            if !wait_for(Duration::from_secs(300), || {
-                self.slot.alive()
-                    && self
-                        .transport
-                        .models_available(&self.config.base_url, self.config.api_key.as_deref())
+            match wait_for_process_health(Duration::from_secs(300), &self.slot, || {
+                self.transport
+                    .models_available(&self.config.base_url, self.config.api_key.as_deref())
             }) {
-                let tail = log_tail(Some(&log), 20);
-                self.slot.clear();
-                return Err(format!("vLLM did not become ready. {tail}"));
+                WaitOutcome::Success => {}
+                WaitOutcome::ProcessExited(code) => {
+                    let tail = log_tail(Some(&log), 20);
+                    self.slot.clear();
+                    let code_str = code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
+                    return Err(format!("vLLM process exited prematurely with code {code_str}. {tail}"));
+                }
+                WaitOutcome::TimedOut => {
+                    let tail = log_tail(Some(&log), 20);
+                    self.slot.clear();
+                    return Err(format!("vLLM did not become ready within 300s. {tail}"));
+                }
             }
         } else {
             if !self
@@ -161,6 +174,19 @@ impl LlmBackend for Vllm {
         cancel: &AtomicBool,
         listener: &mut dyn FnMut(StreamEvent),
     ) {
+        let has_managed_child = self.slot.has_child_process();
+        if self.slot.loaded().is_none() && !has_managed_child {
+            listener(StreamEvent::Error(
+                "vLLM backend is not loaded — press Load first.".into(),
+            ));
+            return;
+        }
+        if has_managed_child && !self.slot.alive() {
+            listener(StreamEvent::Error(
+                "The managed vLLM process exited — press Load to restart it.".into(),
+            ));
+            return;
+        }
         let loaded = self.slot.loaded();
         let fallback_model = loaded.as_deref().or_else(|| {
             let configured = self.config.model_id.trim();

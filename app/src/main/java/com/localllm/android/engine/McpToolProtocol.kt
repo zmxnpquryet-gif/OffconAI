@@ -6,6 +6,7 @@ import com.localllm.android.engine.ToolTextSpans.matchDelimited
 import com.localllm.android.engine.ToolTextSpans.stripCodeFence
 import com.localllm.android.engine.ToolTextSpans.stripRanges
 import com.localllm.android.model.ToolCallTemplate
+import kotlinx.coroutines.CancellationException
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -70,6 +71,9 @@ object McpToolProtocol {
     /** Tool output beyond this is cut so a chatty tool cannot blow the context window. */
     const val MAX_RESULT_CHARS = 4000
 
+    /** Maximum rolling prompt history entries, trimmed back to a user turn boundary. */
+    const val MAX_HISTORY_ENTRIES = 8
+
     /** Dialects the parser knows, in recovery order. */
     private val DIALECTS = listOf(
         ToolCallTemplate.HERMES,
@@ -87,6 +91,30 @@ object McpToolProtocol {
     )
 
     private const val QWEN_FN_OPEN = "<function="
+
+    /** Markers that must never be partially published as ordinary answer text. */
+    val STREAM_HOLDBACK_MARKERS: List<String> = listOf(
+        OPEN,
+        CLOSE,
+        QWEN_FN_OPEN,
+        Gemma4ToolCodec.GEMMA4_OPEN,
+        Gemma4ToolCodec.GEMMA4_CLOSE,
+        Gemma4ToolCodec.LFM_PY_OPEN,
+        Gemma4ToolCodec.LFM_PY_CLOSE,
+        MINICPM5_OPEN,
+        MINICPM5_CLOSE,
+        LLAMA_TAG,
+        MISTRAL_OPEN,
+        GLM4_CLOSE,
+        DEEPSEEK_CALLS_BEGIN,
+        DEEPSEEK_CALL_BEGIN,
+        DEEPSEEK_CALL_END,
+        DEEPSEEK_CALLS_END,
+        DEEPSEEK_NAME,
+        DEEPSEEK_SEP,
+        COHERE_FIELD
+    )
+    private val longestStreamMarkerLength = STREAM_HOLDBACK_MARKERS.maxOf { it.length }
 
     /**
      * System-prompt block describing the connected tools and how to call them in the
@@ -295,8 +323,17 @@ object McpToolProtocol {
         // ignore the wrapper. It stays available for Hermes/QwenXml/auto only, so a normal
         // answer full of JSON is not mistaken for a call under another dialect.
         if (dialect == ToolCallTemplate.HERMES || dialect == ToolCallTemplate.QWEN_XML || dialect == ToolCallTemplate.AUTO) {
-            val standalone = tryStandaloneJson(text, available)
-            if (standalone != null) return ToolCallBatch(listOf(standalone), "")
+            when (val standalone = tryStandaloneJson(text, available)) {
+                is Decoded.Valid -> return ToolCallBatch(listOf(standalone.call), "")
+                // Tool-shaped JSON (a name plus arguments/parameters) that failed
+                // validation is a mistyped call, not prose: surface the reason so
+                // the model corrects the name/args instead of silently dropping it.
+                // Plain JSON without a tool shape still reads as a normal answer.
+                is Decoded.Invalid -> if (hasStandaloneToolShape(text)) {
+                    return ToolCallBatch(emptyList(), text, listOf(standalone.reason), false)
+                }
+                null -> {}
+            }
         }
         if (text.contains(Gemma4ToolCodec.LFM_PY_OPEN)) {
             val py = collectLfmPythonic(text, available)
@@ -1035,6 +1072,36 @@ object McpToolProtocol {
         return text
     }
 
+    /**
+     * Drops a trailing fragment that could still become hidden tool syntax.
+     * Consumers call this only at UI/network publication points, never per token.
+     */
+    fun stableVisiblePrefix(text: String): String {
+        var end = text.length
+        var passes = longestStreamMarkerLength + 1
+        while (passes-- > 0) {
+            while (end > 0 && text[end - 1].isWhitespace()) end--
+            val fragmentStart = trailingMarkerFragmentStart(text, end)
+            if (fragmentStart == end) break
+            end = fragmentStart
+        }
+        return if (end == text.length) text else text.substring(0, end)
+    }
+
+    private fun trailingMarkerFragmentStart(text: String, end: Int): Int {
+        val maxLength = minOf(end, longestStreamMarkerLength - 1)
+        for (length in maxLength downTo 1) {
+            val start = end - length
+            if (STREAM_HOLDBACK_MARKERS.any { marker ->
+                    marker.length > length && marker.regionMatches(0, text, start, length)
+                }
+            ) {
+                return start
+            }
+        }
+        return end
+    }
+
     fun visibleTextAll(text: String): String {
         var result = text
         while (true) {
@@ -1123,39 +1190,169 @@ object McpToolProtocol {
     suspend fun executeBatch(
         calls: List<McpToolCall>,
         approval: ToolApprovalPolicy,
-        invoker: ToolInvoker
+        invoker: ToolInvoker,
+        onExecution: suspend (ToolExecution) -> Unit = {}
     ): List<ToolExecution> {
         val out = mutableListOf<ToolExecution>()
-        for (call in calls.take(MAX_CALLS_PER_TURN)) {
-            if (!approval.approve(call)) {
-                out += ToolExecution(call, approved = false, declined = true)
+        val boundedCalls = calls.take(MAX_CALLS_PER_TURN)
+        suspend fun notifyDuringCancellation(execution: ToolExecution, cancelled: CancellationException) {
+            try {
+                onExecution(execution)
+            } catch (persistError: Throwable) {
+                if (persistError !== cancelled) cancelled.addSuppressed(persistError)
+            }
+        }
+
+        for ((index, call) in boundedCalls.withIndex()) {
+            val approved = try {
+                approval.approve(call)
+            } catch (cancelled: CancellationException) {
+                val notRun = ToolExecution(
+                    call = call,
+                    approved = false,
+                    result = McpToolCallResult(
+                        isSuccess = false,
+                        text = "",
+                        message = "Not run; approval was interrupted before execution."
+                    ),
+                    declined = true
+                )
+                notifyDuringCancellation(notRun, cancelled)
+                for (pending in boundedCalls.drop(index + 1)) {
+                    notifyDuringCancellation(
+                        ToolExecution(
+                            call = pending,
+                            approved = false,
+                            result = McpToolCallResult(
+                                isSuccess = false,
+                                text = "",
+                                message = "Not run because the turn was cancelled before approval."
+                            ),
+                            declined = true
+                        ),
+                        cancelled
+                    )
+                }
+                throw cancelled
+            }
+            if (!approved) {
+                val declined = ToolExecution(call, approved = false, declined = true)
+                out += declined
+                onExecution(declined)
                 break
             }
-            val result = runCatching { invoker.invoke(call) }.getOrElse { error ->
+            val result = try {
+                invoker.invoke(call)
+            } catch (cancelled: CancellationException) {
+                // Once invocation begins the remote side effect may already have
+                // happened. Persist an explicit unknown outcome before propagating
+                // cancellation so the transcript never implies that it was not run.
+                val interrupted = ToolExecution(
+                    call = call,
+                    approved = true,
+                    result = McpToolCallResult(
+                        isSuccess = false,
+                        text = "",
+                        message = "Invocation was interrupted; the remote outcome is unknown."
+                    )
+                )
+                notifyDuringCancellation(interrupted, cancelled)
+                for (pending in boundedCalls.drop(index + 1)) {
+                    notifyDuringCancellation(
+                        ToolExecution(
+                            call = pending,
+                            approved = false,
+                            result = McpToolCallResult(
+                                isSuccess = false,
+                                text = "",
+                                message = "Not run because the turn was cancelled before invocation."
+                            ),
+                            declined = true
+                        ),
+                        cancelled
+                    )
+                }
+                throw cancelled
+            } catch (error: Exception) {
                 McpToolCallResult(
                     isSuccess = false,
                     text = "",
                     message = error.localizedMessage ?: error.message ?: "Tool execution failed"
                 )
             }
-            out += ToolExecution(call, approved = true, result = result)
+            val execution = ToolExecution(call, approved = true, result = result)
+            out += execution
+            // Commit each outcome before asking approval for the next call.
+            onExecution(execution)
         }
         return out
     }
 
-    fun formatExecutions(executions: List<ToolExecution>): String = executions.joinToString("\n") { execution ->
-        if (execution.declined) {
-            formatResult(execution.call.name, false, "The user declined to run this tool.")
-        } else {
-            val result = execution.result
-            val output = if (result == null) "" else result.text.ifBlank { result.message }
-            formatResult(
-                execution.call.name,
-                result?.isSuccess == true,
-                output
+    /** Close calls the executor did not reach after an earlier approval was declined. */
+    fun completeUnexecuted(
+        calls: List<McpToolCall>,
+        executions: List<ToolExecution>
+    ): List<ToolExecution> {
+        if (executions.size >= calls.size) return executions
+        val remaining = (MAX_CALLS_PER_TURN - executions.size).coerceAtLeast(0)
+        if (remaining == 0) return executions
+        return executions + calls.take(MAX_CALLS_PER_TURN).drop(executions.size).take(remaining).map { call ->
+            ToolExecution(
+                call = call,
+                approved = false,
+                result = McpToolCallResult(
+                    isSuccess = false,
+                    text = "",
+                    message = "Skipped because an earlier tool call was declined."
+                ),
+                declined = true
             )
         }
     }
+
+    /** Shared transcript/prompt result encoding for one completed call. */
+    fun resultText(execution: ToolExecution): String {
+        if (execution.declined) {
+            val reason = execution.result?.message?.takeIf { it.isNotBlank() }
+                ?: "The user declined to run this tool."
+            return formatResult(execution.call.name, false, reason)
+        }
+        val result = execution.result
+        val output = if (result == null) "" else result.text.ifBlank { result.message }
+        return formatResult(execution.call.name, result?.isSuccess == true, output)
+    }
+
+    fun formatExecutions(executions: List<ToolExecution>): String =
+        executions.joinToString("\n") { resultText(it) }
+
+    /** Append a user/assistant pair and trim at a user boundary. */
+    fun appendTurnPair(
+        history: List<Pair<String, String>>,
+        userTurn: String,
+        assistantTurn: String,
+        maxEntries: Int = MAX_HISTORY_ENTRIES
+    ): List<Pair<String, String>> = trimHistory(
+        history +
+            (com.localllm.android.model.MessageRole.USER.name to userTurn) +
+            (com.localllm.android.model.MessageRole.ASSISTANT.name to assistantTurn),
+        maxEntries
+    )
+
+    /** Keep a bounded prompt history whose first entry is a user turn. */
+    fun trimHistory(
+        history: List<Pair<String, String>>,
+        maxEntries: Int = MAX_HISTORY_ENTRIES
+    ): List<Pair<String, String>> {
+        if (history.isEmpty()) return emptyList()
+        val tail = history.takeLast(maxEntries.coerceAtLeast(1))
+        val firstUser = tail.indexOfFirst { it.first.equals("user", ignoreCase = true) }
+        return if (firstUser < 0) emptyList() else tail.subList(firstUser, tail.size).toList()
+    }
+
+    /** User-visible terminal feedback when another tool round cannot be executed. */
+    fun formatRoundBudgetExhausted(limit: Int = MAX_TOOL_ROUNDS): String =
+        "I stopped because this message reached the $limit-round tool-use limit. " +
+            "Some requested tools were not run."
 
     /** Wraps a tool outcome as untrusted data for the next model turn. */
     fun formatResult(toolName: String, success: Boolean, output: String): String {
@@ -1290,10 +1487,16 @@ object McpToolProtocol {
         }
     }
 
-    private fun tryStandaloneJson(text: String, available: List<McpTool>): McpToolCall? {
+    private fun tryStandaloneJson(text: String, available: List<McpTool>): Decoded? {
         val trimmed = text.trim()
         if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return null
-        return (decodeCall(trimmed, available) as? Decoded.Valid)?.call
+        return decodeCall(trimmed, available)
+    }
+
+    private fun hasStandaloneToolShape(text: String): Boolean {
+        val obj = parseObject(text.trim()) ?: return false
+        if (obj.has("function")) return true
+        return obj.has("arguments") || obj.has("parameters")
     }
 
     private fun parseObject(raw: String): JSONObject? = try {

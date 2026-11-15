@@ -233,14 +233,21 @@ internal class LlamaSessionRunner(
                 val promptEvalTimeSec = ((firstAt - startTime) / 1000f).coerceAtLeast(0.001f)
                 val promptSpeed = realPromptTokens.toFloat() / promptEvalTimeSec
 
+                // Snapshot buffer lengths first: substring() below copies only the
+                // newly committed delta (O(delta)), while toString() of the whole
+                // buffer every token would make a long generation O(n^2).
+                val prevContentLen = reasoningParser.contentBuffer.length
+                val prevReasoningLen = reasoningParser.reasoningBuffer.length
                 reasoningParser.processChunk(rawWord)
 
                 emit(
                     GenerationChunk(
                         token = rawWord,
                         isReasoning = reasoningParser.isInReasoningMode,
-                        currentReasoningText = reasoningParser.reasoningBuffer.toString(),
-                        currentContentText = reasoningParser.contentBuffer.toString(),
+                        currentReasoningText = "",
+                        currentContentText = "",
+                        contentDelta = reasoningParser.contentBuffer.substring(prevContentLen),
+                        reasoningDelta = reasoningParser.reasoningBuffer.substring(prevReasoningLen),
                         tps = currentTps,
                         promptSpeed = promptSpeed,
                         totalTokens = totalTokens,

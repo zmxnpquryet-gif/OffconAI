@@ -213,11 +213,7 @@ impl ChatMessage {
                 kind: "function".into(),
                 function: OpenAiFunctionCall {
                     name: call.name.clone(),
-                    arguments: if call.arguments.trim().is_empty() {
-                        "{}".into()
-                    } else {
-                        call.arguments.clone()
-                    },
+                    arguments: normalize_function_arguments(&call.arguments),
                 },
             })
             .collect();
@@ -242,6 +238,29 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: None,
         }
+    }
+}
+
+/// OpenAI-compatible tool-call history requires `function.arguments` to be a
+/// JSON object encoded as a string. Match the MCP adapter's input handling so
+/// follow-up chat requests remain valid even when a model emitted a scalar,
+/// double-encoded object, or malformed JSON.
+fn normalize_function_arguments(arguments: &str) -> String {
+    let raw = arguments.trim();
+    if raw.is_empty() || raw == "{}" {
+        return "{}".into();
+    }
+
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Object(map)) => Value::Object(map).to_string(),
+        Ok(Value::String(inner)) => match serde_json::from_str::<Value>(&inner) {
+            Ok(Value::Object(map)) => Value::Object(map).to_string(),
+            _ => serde_json::json!({ "input": inner }).to_string(),
+        },
+        Ok(value) => serde_json::json!({ "input": value }).to_string(),
+        // MCP rejects invalid JSON. Keep the original attempted text visible
+        // inside a valid object so strict chat APIs can accept the history.
+        Err(_) => serde_json::json!({ "input": raw }).to_string(),
     }
 }
 

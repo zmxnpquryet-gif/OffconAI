@@ -2,40 +2,164 @@
 
 import { ScrollView } from "std-widgets.slint";
 import { ChatTurn, Ui } from "theme.slint";
-import { Card, FlatButton, Glyph, SectionLabel, StatusDot } from "widgets.slint";
+import { Card, CompactButton, FlatButton, Glyph, SectionLabel, StatusDot } from "widgets.slint";
 
 component ChatTurnView inherits VerticalLayout {
     in property <ChatTurn> turn;
 
     property <bool> is-user: turn.kind == 0;
+    property <bool> is-assistant: turn.kind == 1;
     property <bool> is-reasoning: turn.kind == 2;
     property <bool> is-tool: turn.kind == 3;
     property <bool> is-error: turn.kind == 4;
-    property <length> body-size: is-reasoning ? 12px : is-tool ? 11px : 14px;
-    property <length> body-indent: (is-reasoning || is-tool) ? 12px : 0px;
 
     width: 100%;
-    spacing: 3px;
+    spacing: 4px;
 
-    Text {
+    if is-user : HorizontalLayout {
+        alignment: end;
         width: 100%;
-        text: turn.role;
-        font-size: 11px;
-        font-family: is-tool ? Ui.font-mono : Ui.font-sans;
-        color: is-error ? Ui.error : Ui.muted;
-        horizontal-alignment: is-user ? right : left;
+
+        Rectangle {
+            background: Ui.user-bubble;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Ui.hairline;
+            max-width: parent.width * 0.85;
+
+            VerticalLayout {
+                padding-left: 14px;
+                padding-right: 14px;
+                padding-top: 10px;
+                padding-bottom: 10px;
+                spacing: 2px;
+
+                Text {
+                    text: turn.role;
+                    font-size: 11px;
+                    color: Ui.accent;
+                    horizontal-alignment: right;
+                }
+                Text {
+                    text: turn.body;
+                    wrap: TextWrap.word-wrap;
+                    font-size: 14px;
+                    font-family: Ui.font-sans;
+                    color: Ui.text;
+                    horizontal-alignment: left;
+                    line-height-factor: 1.4;
+                }
+            }
+        }
     }
 
-    Text {
-        width: parent.width - body-indent;
-        x: body-indent;
-        text: turn.body;
-        wrap: TextWrap.word-wrap;
-        font-size: body-size;
-        font-family: is-tool ? Ui.font-mono : Ui.font-sans;
-        color: is-error ? Ui.error : (is-tool || is-reasoning) ? Ui.muted : Ui.text;
-        horizontal-alignment: is-user ? right : left;
-        line-height-factor: 1.4;
+    if is-reasoning : Rectangle {
+        background: Ui.reasoning-surface;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Ui.hairline;
+        width: 100%;
+
+        VerticalLayout {
+            padding: 10px;
+            spacing: 4px;
+
+            Text {
+                text: "💭 " + turn.role;
+                font-size: 11px;
+                font-family: Ui.font-mono;
+                color: Ui.muted;
+            }
+            Text {
+                text: turn.body;
+                wrap: TextWrap.word-wrap;
+                font-size: 12px;
+                font-family: Ui.font-mono;
+                color: Ui.muted;
+                line-height-factor: 1.35;
+            }
+        }
+    }
+
+    if is-tool : Rectangle {
+        background: Ui.tool-surface;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Ui.hairline;
+        width: 100%;
+
+        VerticalLayout {
+            padding: 10px;
+            spacing: 4px;
+
+            Text {
+                text: "🛠️ " + turn.role;
+                font-size: 11px;
+                font-family: Ui.font-mono;
+                color: Ui.accent;
+            }
+            Text {
+                text: turn.body;
+                wrap: TextWrap.word-wrap;
+                font-size: 11px;
+                font-family: Ui.font-mono;
+                color: Ui.text;
+                line-height-factor: 1.35;
+            }
+        }
+    }
+
+    if is-assistant : VerticalLayout {
+        width: 100%;
+        spacing: 4px;
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+            Text {
+                text: turn.role;
+                font-size: 11px;
+                font-weight: 500;
+                color: Ui.text;
+            }
+        }
+
+        Text {
+            width: 100%;
+            text: turn.body;
+            wrap: TextWrap.word-wrap;
+            font-size: 14px;
+            font-family: Ui.font-sans;
+            color: Ui.text;
+            line-height-factor: 1.4;
+        }
+    }
+
+    if is-error : Rectangle {
+        background: Ui.surface;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Ui.error;
+        width: 100%;
+
+        VerticalLayout {
+            padding: 10px;
+            spacing: 4px;
+
+            Text {
+                text: "⚠️ " + turn.role;
+                font-size: 11px;
+                font-weight: 500;
+                color: Ui.error;
+            }
+            Text {
+                text: turn.body;
+                wrap: TextWrap.word-wrap;
+                font-size: 12px;
+                color: Ui.error;
+                line-height-factor: 1.35;
+            }
+        }
     }
 }
 
@@ -106,22 +230,26 @@ export component ChatWorkspace inherits VerticalLayout {
     callback stop-requested();
     callback approve-tool-requested();
     callback decline-tool-requested();
+    callback export-chat-requested();
+    callback export-json-requested();
+    callback copy-transcript-requested();
+    callback clear-chat-requested();
 
     spacing: 8px;
     horizontal-stretch: 1;
     vertical-stretch: 1;
 
     HorizontalLayout {
-        height: 18px;
+        height: 24px;
         spacing: 8px;
         alignment: start;
 
         Rectangle {
             width: 6px;
-            height: 18px;
+            height: 24px;
             background: transparent;
             StatusDot {
-                y: 6px;
+                y: 9px;
                 active: root.model-loaded;
             }
         }
@@ -133,6 +261,26 @@ export component ChatWorkspace inherits VerticalLayout {
             vertical-alignment: center;
         }
         Rectangle { horizontal-stretch: 1; background: transparent; }
+        if root.turns.length > 0 : CompactButton {
+            label: "Export .md";
+            button-enabled: !root.busy;
+            clicked => { root.export-chat-requested(); }
+        }
+        if root.turns.length > 0 : CompactButton {
+            label: "Export .json";
+            button-enabled: !root.busy;
+            clicked => { root.export-json-requested(); }
+        }
+        if root.turns.length > 0 : CompactButton {
+            label: "Copy All";
+            button-enabled: !root.busy;
+            clicked => { root.copy-transcript-requested(); }
+        }
+        if root.turns.length > 0 : CompactButton {
+            label: "Clear";
+            button-enabled: !root.busy;
+            clicked => { root.clear-chat-requested(); }
+        }
         Text {
             text: root.endpoint-name;
             font-size: 11px;
@@ -234,12 +382,20 @@ export component ChatWorkspace inherits VerticalLayout {
                     color: Ui.text;
                     overflow: elide;
                 }
-                Text {
-                    text: root.pending-tool-args;
-                    font-size: 11px;
-                    font-family: Ui.font-mono;
-                    color: Ui.muted;
-                    overflow: elide;
+                tool-args-scroll := ScrollView {
+                    width: 100%;
+                    height: 64px;
+                    vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+
+                    Text {
+                        width: tool-args-scroll.visible-width;
+                        text: root.pending-tool-args;
+                        wrap: TextWrap.word-wrap;
+                        font-size: 11px;
+                        font-family: Ui.font-mono;
+                        color: Ui.muted;
+                    }
                 }
             }
 
@@ -250,12 +406,14 @@ export component ChatWorkspace inherits VerticalLayout {
                 FlatButton {
                     label: "Decline";
                     height: 32px;
+                    button-enabled: root.awaiting-tool-approval;
                     clicked => { root.decline-tool-requested(); }
                 }
                 FlatButton {
                     label: "Run tool";
                     primary: true;
                     height: 32px;
+                    button-enabled: root.awaiting-tool-approval;
                     clicked => { root.approve-tool-requested(); }
                 }
             }
@@ -280,11 +438,13 @@ export component ChatWorkspace inherits VerticalLayout {
             font-size: 14px;
             font-family: Ui.font-sans;
             color: Ui.text;
-            enabled: !root.busy;
+            enabled: !root.busy && !root.awaiting-tool-approval;
             selection-background-color: Ui.accent;
             selection-foreground-color: #FFFFFF;
+            accessible-label: "Message prompt";
+            accessible-placeholder-text: "Write a prompt...";
             key-pressed(event) => {
-                if (event.text == "\n" && !event.modifiers.shift) {
+                if (event.text == "\n" && !event.modifiers.shift && !root.busy && !root.awaiting-tool-approval) {
                     root.send-requested();
                     return accept;
                 }
@@ -301,6 +461,7 @@ export component ChatWorkspace inherits VerticalLayout {
             font-size: 14px;
             color: Ui.muted;
             vertical-alignment: center;
+            accessible-role: none;
         }
 
         HorizontalLayout {
@@ -328,7 +489,7 @@ export component ChatWorkspace inherits VerticalLayout {
             FlatButton {
                 label: "Send";
                 primary: true;
-                button-enabled: !root.busy;
+                button-enabled: !root.busy && !root.awaiting-tool-approval;
                 height: 26px;
                 clicked => { root.send-requested(); }
             }
