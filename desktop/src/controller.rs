@@ -12,21 +12,21 @@ use crate::mcp::{McpCallOutcome, McpClient, McpConnectionInfo};
 use crate::process::{
     format_resources, parse_command, parse_f64_clamped, parse_port, parse_u32, parse_u32_clamped,
 };
-use crate::session::{ConversationSession, TurnEntry};
+use crate::session::{estimate_text_tokens, ConversationSession, TurnEntry};
 use crate::{ChatTurn, MainWindow};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_TOOL_ROUNDS: u32 = 3;
-const MAX_CALLS_PER_TURN: usize = 4;
 
 enum BackendChoice {
     Llama(LlamaCppConfig),
@@ -93,9 +93,14 @@ pub struct DesktopController {
     session: ConversationSession,
     generation: Option<Arc<AtomicBool>>,
     pending_calls: VecDeque<(usize, ToolCallRecord)>,
+    tool_execution_active: bool,
+    stop_after_tool: bool,
     current_tool_round: u32,
     busy: bool,
     resource_ticks: u32,
+    stream_started_at: Option<std::time::Instant>,
+    stream_token_count: usize,
+    stream_last_tps_update: Option<std::time::Instant>,
 }
 
 impl DesktopController {
@@ -111,9 +116,14 @@ impl DesktopController {
             session: ConversationSession::new(),
             generation: None,
             pending_calls: VecDeque::new(),
+            tool_execution_active: false,
+            stop_after_tool: false,
             current_tool_round: 0,
             busy: false,
             resource_ticks: 0,
+            stream_started_at: None,
+            stream_token_count: 0,
+            stream_last_tps_update: None,
         }
     }
 
@@ -191,33 +201,62 @@ impl DesktopController {
                 ui.set_status_error(true);
             }
             UiEvent::Delta { text, reasoning } => {
-                if let Some(reasoning) = reasoning {
-                    if let Some((idx, entry, inserted)) = self.session.append_reasoning(&reasoning)
-                    {
-                        self.sync_turn(&ui, idx, entry, inserted);
+                let chunk_tokens = text.as_deref().map(estimate_text_tokens).unwrap_or(0)
+                    + reasoning.as_deref().map(estimate_text_tokens).unwrap_or(0);
+                self.stream_token_count += chunk_tokens.max(1);
+
+                let now = Instant::now();
+                if let (Some(started), Some(last)) = (self.stream_started_at, self.stream_last_tps_update) {
+                    if now.duration_since(last) >= Duration::from_millis(300) {
+                        self.stream_last_tps_update = Some(now);
+                        let elapsed = now.duration_since(started).as_secs_f64();
+                        let tps = if elapsed > 0.05 {
+                            self.stream_token_count as f64 / elapsed
+                        } else {
+                            0.0
+                        };
+                        ui.set_status(format!("Generating... \u{00B7} {:.1} t/s ({} tokens)", tps, self.stream_token_count).into());
                     }
                 }
-                if let Some(text) = text {
-                    if let Some((idx, entry, inserted)) = self.session.append_assistant(&text) {
-                        self.sync_turn(&ui, idx, entry, inserted);
-                    }
+
+                for (_, idx, entry, inserted) in self
+                    .session
+                    .ingest_delta(text.as_deref(), reasoning.as_deref())
+                {
+                    self.sync_turn(&ui, idx, entry, inserted);
                 }
             }
             UiEvent::ToolCall(call) => {
-                let entry = self.session.push_tool_call(call);
-                self.turns_model.push(to_chat_turn(entry));
-                self.touch_transcript(&ui);
+                if let Some(entry) = self.session.push_tool_call(call) {
+                    self.turns_model.push(to_chat_turn(entry));
+                    self.touch_transcript(&ui);
+                }
             }
             UiEvent::ToolExecuted {
                 call,
                 index,
                 outcome,
             } => {
+                self.tool_execution_active = false;
                 let entry =
                     self.session
                         .record_tool_result(&call, index, &outcome.output, outcome.is_success);
                 self.turns_model.push(to_chat_turn(entry));
                 self.touch_transcript(&ui);
+                if self.stop_after_tool {
+                    self.stop_after_tool = false;
+                    self.record_skipped_pending_calls(
+                        &ui,
+                        "Not run because execution was stopped after the current tool call.",
+                        "Not run because execution was stopped after the current tool call.",
+                    );
+                    self.clear_tool_approval_ui(&ui);
+                    self.set_busy(&ui, false);
+                    ui.set_status("Stopped after the current MCP tool call finished.".into());
+                    ui.set_status_error(false);
+                    self.refresh_resources();
+                    return;
+                }
                 self.prompt_next_tool_or_continue(&ui);
             }
             UiEvent::Error(message) => {
@@ -228,6 +267,9 @@ impl DesktopController {
                 ui.set_status_error(true);
             }
             UiEvent::Done { cancelled } => {
+                if let Some((_, idx, entry, inserted)) = self.session.flush_pending_delta() {
+                    self.sync_turn(&ui, idx, entry, inserted);
+                }
                 let had_error = self.session.had_error;
                 let (calls, from_inline) = self.session.finish_turn();
                 if from_inline {
@@ -243,6 +285,14 @@ impl DesktopController {
                 self.generation = None;
 
                 if cancelled || had_error {
+                    if !calls.is_empty() {
+                        let reason = if cancelled {
+                            "Not run because generation was stopped before tool execution."
+                        } else {
+                            "Not run because generation failed before tool execution."
+                        };
+                        self.record_skipped_calls(&ui, calls, reason);
+                    }
                     self.pending_calls.clear();
                     self.clear_tool_approval_ui(&ui);
                     self.set_busy(&ui, false);
@@ -254,21 +304,41 @@ impl DesktopController {
                     return;
                 }
 
-                if !calls.is_empty()
-                    && self.mcp.is_connected()
-                    && self.current_tool_round < MAX_TOOL_ROUNDS
-                {
-                    self.current_tool_round += 1;
-                    // Ensure inline-parsed `<tool_call>` calls also appear in the transcript.
-                    for (idx, call) in calls.into_iter().take(MAX_CALLS_PER_TURN).enumerate() {
-                        self.pending_calls.push_back((idx, call));
+                if !calls.is_empty() {
+                    if self.mcp.is_connected() && self.current_tool_round < MAX_TOOL_ROUNDS {
+                        self.current_tool_round += 1;
+                        for (idx, call) in calls.into_iter().enumerate() {
+                            self.pending_calls.push_back((idx, call));
+                        }
+                        self.prompt_next_tool_or_continue(&ui);
+                        return;
                     }
-                    self.prompt_next_tool_or_continue(&ui);
+
+                    let reason = if !self.mcp.is_connected() {
+                        "Not run because no MCP server is connected."
+                    } else {
+                        "Not run because the tool-call round limit was reached."
+                    };
+                    self.record_skipped_calls(&ui, calls, reason);
+                    self.set_busy(&ui, false);
+                    ui.set_status(reason.into());
+                    ui.set_status_error(true);
+                    self.refresh_resources();
                     return;
                 }
 
                 self.set_busy(&ui, false);
-                ui.set_status("Ready".into());
+                let elapsed = self.stream_started_at.take().map(|s| s.elapsed()).unwrap_or_default();
+                let total_tokens = self.stream_token_count;
+                self.stream_last_tps_update = None;
+
+                if total_tokens > 0 {
+                    let secs = elapsed.as_secs_f64();
+                    let tps = if secs > 0.05 { total_tokens as f64 / secs } else { 0.0 };
+                    ui.set_status(format!("Ready \u{00B7} {} tokens in {:.1}s ({:.1} t/s)", total_tokens, secs, tps).into());
+                } else {
+                    ui.set_status("Ready".into());
+                }
                 ui.set_status_error(false);
                 self.refresh_resources();
             }
@@ -311,12 +381,53 @@ impl DesktopController {
             return;
         };
         self.session.prepare_continuation_round();
+        self.session.set_system_prompt(ui.get_system_prompt().to_string());
         let temperature = parse_f64_clamped(&ui.get_temperature_text(), 0.7, 0.0, 2.0);
         let max_tokens = parse_u32_clamped(&ui.get_max_tokens_text(), 1024, 1, 32_768);
-        let request = self
+        let mut request = self
             .session
             .build_request(self.mcp.current_tools(), temperature, max_tokens);
+        let label = ui.get_model_label().trim().to_string();
+        if !label.is_empty() {
+            request.model = Some(label);
+        }
         self.spawn_stream(ui, backend, request);
+    }
+
+    fn record_skipped_calls(
+        &mut self,
+        ui: &MainWindow,
+        calls: Vec<ToolCallRecord>,
+        reason: &str,
+    ) {
+        for (index, call) in calls.iter().enumerate() {
+            let entry = self.session.record_tool_result(call, index, reason, false);
+            self.turns_model.push(to_chat_turn(entry));
+        }
+        if !calls.is_empty() {
+            self.touch_transcript(ui);
+        }
+    }
+
+    fn record_skipped_pending_calls(
+        &mut self,
+        ui: &MainWindow,
+        first_reason: &str,
+        remaining_reason: &str,
+    ) {
+        let calls: Vec<_> = self.pending_calls.drain(..).collect();
+        for (position, (index, call)) in calls.iter().enumerate() {
+            let reason = if position == 0 {
+                first_reason
+            } else {
+                remaining_reason
+            };
+            let entry = self.session.record_tool_result(call, *index, reason, false);
+            self.turns_model.push(to_chat_turn(entry));
+        }
+        if !calls.is_empty() {
+            self.touch_transcript(ui);
+        }
     }
 
     fn approve_pending_tool(&mut self) {
@@ -324,6 +435,7 @@ impl DesktopController {
         let Some((index, call)) = self.pending_calls.pop_front() else {
             return;
         };
+        self.tool_execution_active = true;
         self.clear_tool_approval_ui(&ui);
         ui.set_status(format!("Running MCP tool \"{}\"...", call.name).into());
         ui.set_status_error(false);
@@ -341,16 +453,18 @@ impl DesktopController {
 
     fn decline_pending_tool(&mut self) {
         let Some(ui) = self.ui.upgrade() else { return };
-        let Some((index, call)) = self.pending_calls.pop_front() else {
+        if self.tool_execution_active {
             return;
-        };
-        self.pending_calls.clear();
+        }
+        if self.pending_calls.is_empty() {
+            return;
+        }
+        self.record_skipped_pending_calls(
+            &ui,
+            "The user declined to run this tool.",
+            "Not run because an earlier tool call was declined.",
+        );
         self.clear_tool_approval_ui(&ui);
-        let entry =
-            self.session
-                .record_tool_result(&call, index, "The user declined to run this tool.", false);
-        self.turns_model.push(to_chat_turn(entry));
-        self.touch_transcript(&ui);
         self.set_busy(&ui, false);
         ui.set_status("Tool call declined.".into());
         ui.set_status_error(false);
@@ -506,14 +620,31 @@ impl DesktopController {
         let kind = BackendKind::from_index(ui.get_backend_index());
         if self.backend.is_none() {
             ui.set_empty_engine(idle_engine_label(kind).into());
+            ui.set_status(
+                format!(
+                    "{} selected. Configure settings and load or connect.",
+                    kind.label()
+                )
+                .into(),
+            );
+            ui.set_status_error(false);
+            return;
         }
-        ui.set_status(
-            format!(
-                "{} selected. Configure settings and load or connect.",
-                kind.label()
-            )
-            .into(),
-        );
+        let loaded = self.backend.as_ref().map(|b| b.kind());
+        if loaded == Some(kind) {
+            ui.set_status(
+                format!("{} is loaded and ready.", kind.label()).into(),
+            );
+        } else {
+            ui.set_status(
+                format!(
+                    "{} selected — press Load to switch ({} still loaded).",
+                    kind.label(),
+                    loaded.map(BackendKind::label).unwrap_or("?")
+                )
+                .into(),
+            );
+        }
         ui.set_status_error(false);
     }
 
@@ -541,7 +672,7 @@ impl DesktopController {
                 api_key: std::env::var("STRATA_API_KEY").ok(),
                 model_id: ui.get_model_label().to_string(),
                 launch_command: parse_command(&ui.get_strata_launch()),
-                working_directory: Some(PathBuf::from(".")),
+                working_directory: None,
                 ..StrataConfig::default()
             }),
         }
@@ -557,16 +688,40 @@ impl DesktopController {
             ui.set_status_error(true);
             return;
         };
+        let selected_kind = BackendKind::from_index(ui.get_backend_index());
+        if backend.kind() != selected_kind {
+            ui.set_status(
+                format!(
+                    "{} is still loaded. Load the selected {} backend before sending.",
+                    backend.kind().label(),
+                    selected_kind.label()
+                )
+                .into(),
+            );
+            ui.set_status_error(true);
+            return;
+        }
         let raw_prompt = ui.get_input_text().to_string();
+        if raw_prompt.trim().is_empty() {
+            ui.set_status("Type a message first.".into());
+            ui.set_status_error(false);
+            return;
+        }
         let temperature = parse_f64_clamped(&ui.get_temperature_text(), 0.7, 0.0, 2.0);
         let max_tokens = parse_u32_clamped(&ui.get_max_tokens_text(), 1024, 1, 32_768);
         let tools = self.mcp.current_tools();
-        let Some(request) = self
+        self.session.set_system_prompt(ui.get_system_prompt().to_string());
+        let mut request = match self
             .session
             .begin_user_turn(&raw_prompt, tools, temperature, max_tokens)
-        else {
-            return;
+        {
+            Some(req) => req,
+            None => return,
         };
+        let label = ui.get_model_label().trim().to_string();
+        if !label.is_empty() {
+            request.model = Some(label);
+        }
         ui.set_input_text("".into());
         self.pending_calls.clear();
         self.current_tool_round = 0;
@@ -585,6 +740,9 @@ impl DesktopController {
     ) {
         let cancel = Arc::new(AtomicBool::new(false));
         self.generation = Some(cancel.clone());
+        self.stream_started_at = Some(Instant::now());
+        self.stream_token_count = 0;
+        self.stream_last_tps_update = Some(Instant::now());
         let sender = self.sender.clone();
         self.set_busy(ui, true);
         ui.set_status("Generating...".into());
@@ -609,8 +767,18 @@ impl DesktopController {
 
     fn stop_generation(&mut self) {
         let Some(ui) = self.ui.upgrade() else { return };
+        if self.tool_execution_active {
+            self.stop_after_tool = true;
+            ui.set_status("Stopping after the current MCP tool call...".into());
+            ui.set_status_error(false);
+            return;
+        }
         if !self.pending_calls.is_empty() {
-            self.pending_calls.clear();
+            self.record_skipped_pending_calls(
+                &ui,
+                "Not run because the user stopped before approving this tool.",
+                "Not run because the user stopped before approving tool calls.",
+            );
             self.clear_tool_approval_ui(&ui);
             self.set_busy(&ui, false);
             ui.set_status("Stopped.".into());
@@ -635,6 +803,16 @@ impl DesktopController {
             ui.set_status_error(true);
             return;
         }
+        if ui.get_image_endpoint().trim().is_empty() {
+            ui.set_status("Image endpoint is not configured.".into());
+            ui.set_status_error(true);
+            return;
+        }
+        if ui.get_image_model().trim().is_empty() {
+            ui.set_status("Image model is required.".into());
+            ui.set_status_error(true);
+            return;
+        }
         let backend = OpenAiImageBackend::new(
             ui.get_image_endpoint().to_string(),
             std::env::var("IMAGE_API_KEY").ok(),
@@ -652,6 +830,7 @@ impl DesktopController {
         ui.set_status_error(false);
         thread::spawn(move || match backend.generate(&request) {
             Ok(result) => {
+                let output = image_output_path(output, &result.media_type);
                 let write = (|| -> Result<(), String> {
                     if let Some(parent) = output.parent() {
                         if !parent.as_os_str().is_empty() {
@@ -692,6 +871,127 @@ impl DesktopController {
         ui.set_resources(format_resources(&snapshot).into());
     }
 
+    fn export_chat(&mut self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let md = self.session.export_markdown();
+        if self.session.turns().is_empty() {
+            ui.set_status("No conversation to export.".into());
+            ui.set_status_error(false);
+            return;
+        }
+        let export_dir = downloads_directory();
+        if let Err(error) = std::fs::create_dir_all(&export_dir) {
+            ui.set_status(
+                format!("Could not create {}: {error}", export_dir.display()).into(),
+            );
+            ui.set_status_error(true);
+            return;
+        }
+        match write_unique_file(&export_dir, "conversation_export", "md", &md) {
+            Ok(export_path) => {
+                let display_path = export_path.canonicalize().unwrap_or(export_path);
+                ui.set_status(
+                    format!("Conversation exported to {}", display_path.display()).into(),
+                );
+                ui.set_status_error(false);
+            }
+            Err(error) => {
+                ui.set_status(format!("Export failed: {error}").into());
+                ui.set_status_error(true);
+            }
+        }
+    }
+
+    fn export_chat_json(&mut self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let json_str = self.session.export_json();
+        if self.session.turns().is_empty() {
+            ui.set_status("No conversation to export.".into());
+            ui.set_status_error(false);
+            return;
+        }
+        let export_dir = downloads_directory();
+        if let Err(error) = std::fs::create_dir_all(&export_dir) {
+            ui.set_status(
+                format!("Could not create {}: {error}", export_dir.display()).into(),
+            );
+            ui.set_status_error(true);
+            return;
+        }
+        match write_unique_file(&export_dir, "conversation_export", "json", &json_str) {
+            Ok(export_path) => {
+                let display_path = export_path.canonicalize().unwrap_or(export_path);
+                ui.set_status(
+                    format!("Conversation exported to {}", display_path.display()).into(),
+                );
+                ui.set_status_error(false);
+            }
+            Err(error) => {
+                ui.set_status(format!("Export failed: {error}").into());
+                ui.set_status_error(true);
+            }
+        }
+    }
+
+    fn copy_transcript(&mut self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let md = self.session.export_markdown();
+        if self.session.turns().is_empty() {
+            ui.set_status("No conversation to copy.".into());
+            ui.set_status_error(false);
+            return;
+        }
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(md)) {
+            Ok(()) => {
+                ui.set_status("Transcript copied to the clipboard.".into());
+                ui.set_status_error(false);
+            }
+            Err(error) => {
+                ui.set_status(format!("Could not copy transcript: {error}").into());
+                ui.set_status_error(true);
+            }
+        }
+    }
+
+    fn apply_preset(&mut self, preset: i32) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        if self.busy {
+            return;
+        }
+        match preset {
+            0 => {
+                ui.set_model_label("qwen3.5-4b".into());
+                ui.set_temperature_text("0.7".into());
+                ui.set_max_tokens_text("2048".into());
+                ui.set_system_prompt("You are Qwen, a helpful, intelligent AI assistant.".into());
+                ui.set_status("Preset applied: Qwen 3.5 4B".into());
+            }
+            1 => {
+                ui.set_model_label("lfm3-omni-2b".into());
+                ui.set_temperature_text("0.6".into());
+                ui.set_max_tokens_text("1024".into());
+                ui.set_system_prompt("You are a concise, helpful assistant.".into());
+                ui.set_status("Preset applied: LFM3 Omni 2B".into());
+            }
+            2 => {
+                ui.set_model_label("gemma-4".into());
+                ui.set_temperature_text("0.7".into());
+                ui.set_max_tokens_text("4096".into());
+                ui.set_system_prompt("You are Gemma, an AI assistant developed by Google.".into());
+                ui.set_status("Preset applied: Gemma 4".into());
+            }
+            3 => {
+                ui.set_model_label("deepseek-r1-distill-qwen".into());
+                ui.set_temperature_text("0.6".into());
+                ui.set_max_tokens_text("4096".into());
+                ui.set_system_prompt("You are DeepSeek-R1, a reasoning model. Think carefully step by step.".into());
+                ui.set_status("Preset applied: DeepSeek R1 (Thinking)".into());
+            }
+            _ => {}
+        }
+        ui.set_status_error(false);
+    }
+
     fn shutdown(&mut self) {
         if let Some(cancel) = self.generation.take() {
             cancel.store(true, Ordering::SeqCst);
@@ -703,6 +1003,70 @@ impl DesktopController {
     }
 }
 
+fn downloads_directory() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Downloads")
+}
+
+fn write_unique_file(
+    directory: &std::path::Path,
+    prefix: &str,
+    extension: &str,
+    contents: &str,
+) -> Result<PathBuf, String> {
+    let mut suffix = 1u32;
+    loop {
+        let file_name = if suffix == 1 {
+            format!("{prefix}.{extension}")
+        } else {
+            format!("{prefix}_{suffix}.{extension}")
+        };
+        let path = directory.join(file_name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(contents.as_bytes()) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("could not write {}: {error}", path.display()));
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                suffix = suffix
+                    .checked_add(1)
+                    .ok_or_else(|| "no available export filename".to_string())?;
+            }
+            Err(error) => {
+                return Err(format!("could not create {}: {error}", path.display()));
+            }
+        }
+    }
+}
+
+fn image_output_path(path: PathBuf, media_type: &str) -> PathBuf {
+    match media_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/jpeg" | "image/jpg" => path.with_extension("jpg"),
+        "image/png" => path.with_extension("png"),
+        "image/gif" => path.with_extension("gif"),
+        "image/webp" => path.with_extension("webp"),
+        _ => path,
+    }
+}
+
 fn idle_engine_label(kind: BackendKind) -> String {
     format!(
         "{} \u{00B7} {}",
@@ -710,7 +1074,9 @@ fn idle_engine_label(kind: BackendKind) -> String {
         if kind.is_local_process() {
             "local runtime"
         } else {
-            "endpoint"
+            // vLLM/Strata can either spawn a managed local process or attach
+            // to an external endpoint, decided at load time — not by kind.
+            "local runtime or endpoint"
         }
     )
 }
@@ -742,6 +1108,17 @@ pub fn run() -> Result<(), slint::PlatformError> {
     wire!(on_mcp_disconnect_requested, disconnect_mcp);
     wire!(on_approve_tool_requested, approve_pending_tool);
     wire!(on_decline_tool_requested, decline_pending_tool);
+    wire!(on_export_chat_requested, export_chat);
+    wire!(on_export_json_requested, export_chat_json);
+    wire!(on_copy_transcript_requested, copy_transcript);
+    {
+        let weak = Rc::downgrade(&controller);
+        ui.on_apply_preset(move |preset| {
+            if let Some(ctrl) = weak.upgrade() {
+                ctrl.borrow_mut().apply_preset(preset);
+            }
+        });
+    }
 
     let timer = slint::Timer::default();
     {

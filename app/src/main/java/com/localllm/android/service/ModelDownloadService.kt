@@ -21,6 +21,7 @@ import com.localllm.android.MainActivity
 import com.localllm.android.engine.DownloadStatus
 import com.localllm.android.engine.ModelDownloader
 import com.localllm.android.model.LlmModel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -226,6 +227,10 @@ class ModelDownloadService : Service() {
                         stopSelf()
                     }
                 }
+            } catch (e: CancellationException) {
+                // Replacing or cancelling a download is not a failure. In particular,
+                // an older job must not stop the service after a newer download starts.
+                throw e
             } catch (e: Throwable) {
                 Log.e(TAG, "Error during download stream: ${e.message}", e)
                 _currentDownloadStatus.value = DownloadStatus(

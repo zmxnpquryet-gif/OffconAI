@@ -1,6 +1,7 @@
 package com.localllm.android.ui.chat
 
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
@@ -21,6 +22,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -35,15 +38,24 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.localllm.android.R
 import com.localllm.android.model.ChatAttachment
 import com.localllm.android.model.LlmModel
+import com.localllm.android.model.ReasoningEffortTier
+import com.localllm.android.ui.glass.GCompactIconButton
 import com.localllm.android.ui.glass.GIcon
-import com.localllm.android.ui.glass.GIconButton
 import com.localllm.android.ui.glass.GIcons
+import com.localllm.android.ui.glass.GLinearProgress
 import com.localllm.android.ui.glass.GOptionRow
 import com.localllm.android.ui.glass.GSheet
 import com.localllm.android.ui.glass.GSlider
@@ -51,6 +63,7 @@ import com.localllm.android.ui.glass.GSwitch
 import com.localllm.android.ui.glass.GText
 import com.localllm.android.ui.glass.GlassTheme
 import java.util.Locale
+import kotlin.math.roundToInt
 
 @Composable
 fun ChatInputBar(
@@ -77,16 +90,23 @@ fun ChatInputBar(
     currentTps: Float = 0f,
     promptSpeed: Float = 0f,
     contextTokens: Int = 0,
+    isVoiceListening: Boolean = false,
+    isPreparingImage: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     var showAttachmentSheet by remember { mutableStateOf(false) }
     var showReasoningSlider by remember { mutableStateOf(false) }
+    var pickerLaunching by remember { mutableStateOf(false) }
+    val pickerGuard = remember { PickerLaunchGuard() }
     val context = LocalContext.current
     val isDarkCanvas = GlassTheme.colors.background.luminance() < 0.5f
+    val composerLabel = stringResource(R.string.chat_input_hint)
 
     val imagePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
+        pickerGuard.onResult()
+        pickerLaunching = false
         if (uri != null) {
             onSetAttachment(
                 ChatAttachment(
@@ -104,6 +124,8 @@ fun ChatInputBar(
     val documentPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
+        pickerGuard.onResult()
+        pickerLaunching = false
         if (uri != null) {
             val displayName = runCatching {
                 context.contentResolver.query(
@@ -121,6 +143,47 @@ fun ChatInputBar(
         showAttachmentSheet = false
     }
 
+    fun launchImagePicker() {
+        if (!pickerGuard.tryLaunch("image")) return
+        pickerLaunching = true
+        runCatching {
+            imagePicker.launch(
+                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+            )
+        }.onFailure {
+            pickerGuard.onResult()
+            pickerLaunching = false
+            android.widget.Toast.makeText(
+                context,
+                context.getString(R.string.chat_picker_unavailable),
+                android.widget.Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    fun launchDocumentPicker() {
+        if (!pickerGuard.tryLaunch("document")) return
+        pickerLaunching = true
+        runCatching {
+            documentPicker.launch(arrayOf("text/*", "application/pdf", "*/*"))
+        }.onFailure {
+            pickerGuard.onResult()
+            pickerLaunching = false
+            android.widget.Toast.makeText(
+                context,
+                context.getString(R.string.chat_picker_unavailable),
+                android.widget.Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    val canSend = inputText.isNotBlank() || pendingAttachment != null
+    val sendEnabled = isGenerating || canSend
+
+    fun submit() {
+        if (canSend) onSendMessage()
+    }
+
     Column(
         modifier = modifier
             .fillMaxWidth()
@@ -130,12 +193,22 @@ fun ChatInputBar(
     ) {
         // 1. Reasoning Effort quick pill if model supports reasoning (e.g. DeepSeek-R1)
         if (activeModel?.supportsReasoning == true) {
+            val tierLabel = stringResource(ReasoningEffortTier.of(reasoningEffort).labelRes)
+            val effortValue = String.format(Locale.US, "%.1f", reasoningEffort)
+            val effortSummary = stringResource(R.string.chat_reasoning_effort_with_value, tierLabel, effortValue)
+            val effortStateDescription = stringResource(
+                if (showReasoningSlider) R.string.chat_state_expanded else R.string.chat_state_collapsed
+            )
             Row(
                 modifier = Modifier
                     .padding(bottom = 6.dp)
                     .clip(RoundedCornerShape(12.dp))
                     .background(GlassTheme.colors.secondary)
-                    .clickable { showReasoningSlider = !showReasoningSlider }
+                    .semantics {
+                        contentDescription = effortSummary
+                        stateDescription = effortStateDescription
+                    }
+                    .clickable(role = Role.Button) { showReasoningSlider = !showReasoningSlider }
                     .padding(horizontal = 10.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -146,14 +219,8 @@ fun ChatInputBar(
                     modifier = Modifier.size(14.dp)
                 )
                 Spacer(modifier = Modifier.width(6.dp))
-                val effortLabel = when {
-                    reasoningEffort <= 0.25f -> "Low (0.2)"
-                    reasoningEffort <= 0.6f -> "Medium (0.5)"
-                    reasoningEffort <= 0.85f -> "High (0.8)"
-                    else -> "Max (1.0)"
-                }
                 GText(
-                    text = stringResource(R.string.chat_reasoning_effort_label, effortLabel),
+                    text = stringResource(R.string.chat_reasoning_effort_label, effortSummary),
                     style = GlassTheme.type.labelSmall,
                     color = GlassTheme.colors.onSurface
                 )
@@ -221,19 +288,22 @@ fun ChatInputBar(
                             maxLines = 1
                         )
                         GText(
-                            text = if (pendingAttachment.isImage) "이미지" else "파일",
+                            text = stringResource(
+                                if (pendingAttachment.isImage) R.string.chat_attachment_image
+                                else R.string.chat_attachment_file
+                            ),
                             fontSize = 11.sp,
                             color = GlassTheme.colors.onSurfaceVariant
                         )
                     }
 
-                    GIconButton(
+                    GCompactIconButton(
                         onClick = { onSetAttachment(null) },
                         modifier = Modifier.size(28.dp)
                     ) {
                         GIcon(
                             imageVector = GIcons.Close,
-                            contentDescription = "삭제",
+                            contentDescription = stringResource(R.string.chat_attachment_remove),
                             tint = GlassTheme.colors.onSurfaceVariant,
                             modifier = Modifier.size(16.dp)
                         )
@@ -260,7 +330,7 @@ fun ChatInputBar(
             verticalAlignment = Alignment.CenterVertically
         ) {
             // Attachment Icon Button
-            GIconButton(
+            GCompactIconButton(
                 onClick = { showAttachmentSheet = true },
                 modifier = Modifier.size(38.dp)
             ) {
@@ -273,7 +343,7 @@ fun ChatInputBar(
             }
 
             // Hands-free (live) voice mode trigger
-            GIconButton(
+            GCompactIconButton(
                 onClick = onOpenVoiceMode,
                 modifier = Modifier.size(38.dp)
             ) {
@@ -302,21 +372,36 @@ fun ChatInputBar(
                 BasicTextField(
                     value = inputText,
                     onValueChange = onInputTextChanged,
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .semantics { contentDescription = composerLabel },
                     textStyle = GlassTheme.type.bodyLarge.copy(color = GlassTheme.colors.onSurface),
                     cursorBrush = SolidColor(GlassTheme.colors.primary),
-                    maxLines = 5
+                    maxLines = 5,
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Text,
+                        capitalization = KeyboardCapitalization.Sentences,
+                        imeAction = ImeAction.Send
+                    ),
+                    keyboardActions = KeyboardActions(
+                        onSend = {
+                            if (isGenerating) onStopGeneration() else submit()
+                        }
+                    )
                 )
             }
 
             // Mic Icon Button (dictation)
-            GIconButton(
+            val voiceInputLabel = stringResource(
+                if (isVoiceListening) R.string.voice_stop_dictation else R.string.voice_input
+            )
+            GCompactIconButton(
                 onClick = onStartVoiceInput,
                 modifier = Modifier.size(38.dp)
             ) {
                 GIcon(
-                    imageVector = GIcons.Mic,
-                    contentDescription = stringResource(R.string.voice_input),
+                    imageVector = if (isVoiceListening) GIcons.MicOff else GIcons.Mic,
+                    contentDescription = voiceInputLabel,
                     tint = GlassTheme.colors.onSurfaceVariant,
                     modifier = Modifier.size(21.dp)
                 )
@@ -325,53 +410,109 @@ fun ChatInputBar(
             Spacer(modifier = Modifier.width(4.dp))
 
             // Send / Stop Action Button
-            val canSend = inputText.isNotBlank() || pendingAttachment != null
+            val sendDescription = stringResource(
+                if (isGenerating) R.string.stop_generation else R.string.send
+            )
+            val sendStateDescription = stringResource(
+                when {
+                    isGenerating -> R.string.chat_state_streaming
+                    canSend -> R.string.chat_state_ready_to_send
+                    else -> R.string.chat_send_disabled_hint
+                }
+            )
             Box(
                 modifier = Modifier
-                    .size(40.dp)
-                    .clip(CircleShape)
-                    .background(
-                        when {
-                            isGenerating -> GlassTheme.colors.primary
-                            canSend -> GlassTheme.colors.primary
-                            else -> GlassTheme.colors.surfaceVariant
-                        }
-                    )
-                    .clickable(enabled = isGenerating || canSend) {
-                        if (isGenerating) onStopGeneration() else onSendMessage()
+                    .size(48.dp)
+                    .semantics {
+                        contentDescription = sendDescription
+                        stateDescription = sendStateDescription
+                    }
+                    .clickable(enabled = sendEnabled, role = Role.Button) {
+                        if (isGenerating) onStopGeneration() else submit()
                     },
                 contentAlignment = Alignment.Center
             ) {
-                if (isGenerating) {
-                    GIcon(
-                        imageVector = GIcons.Stop,
-                        contentDescription = stringResource(R.string.stop),
-                        tint = GlassTheme.colors.onPrimary,
-                        modifier = Modifier.size(15.dp)
-                    )
-                } else {
-                    GIcon(
-                        imageVector = GIcons.ArrowUp,
-                        contentDescription = stringResource(R.string.send),
-                        tint = if (canSend) GlassTheme.colors.onPrimary else GlassTheme.colors.onSurfaceVariant,
-                        modifier = Modifier.size(18.dp)
-                    )
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(
+                            when {
+                                isGenerating -> GlassTheme.colors.primary
+                                canSend -> GlassTheme.colors.primary
+                                else -> GlassTheme.colors.surfaceVariant
+                            }
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (isGenerating) {
+                        GIcon(
+                            imageVector = GIcons.Stop,
+                            contentDescription = null,
+                            tint = GlassTheme.colors.onPrimary,
+                            modifier = Modifier.size(15.dp)
+                        )
+                    } else {
+                        GIcon(
+                            imageVector = GIcons.ArrowUp,
+                            contentDescription = null,
+                            tint = if (canSend) GlassTheme.colors.onPrimary else GlassTheme.colors.onSurfaceVariant,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                 }
             }
         }
 
         // Streaming / loading status strip below the capsule
-        val status = when {
-            isModelLoading -> modelLoadingStage.ifBlank { stringResource(R.string.model_loading_default) }
-            isGenerating && currentTps > 0f -> String.format(Locale.US, "%.1f tok/s · %d ctx", currentTps, contextTokens)
-            isGenerating && promptSpeed > 0f -> String.format(Locale.US, "프롬프트 처리 중 · %.1f tok/s", promptSpeed)
-            isGenerating -> "생성 중…"
-            else -> null
+        val status = ComposerStatusResolver.resolve(
+            isModelLoading = isModelLoading,
+            modelLoadingProgress = modelLoadingProgress,
+            isGenerating = isGenerating,
+            tokensPerSecond = currentTps,
+            promptTokensPerSecond = promptSpeed,
+            contextTokens = contextTokens,
+            pendingImageInput = isPreparingImage
+        )
+        val statusText = when (status?.phase) {
+            ComposerPhase.MODEL_LOADING -> status.progress?.let {
+                stringResource(
+                    R.string.chat_status_loading_progress,
+                    modelLoadingStage.ifBlank { stringResource(R.string.model_loading_default) },
+                    (it * 100).roundToInt()
+                )
+            } ?: modelLoadingStage.ifBlank { stringResource(R.string.model_loading_default) }
+            ComposerPhase.PREPARING_IMAGE -> stringResource(R.string.chat_status_preparing_image)
+            ComposerPhase.GENERATING -> stringResource(
+                R.string.chat_status_metrics,
+                String.format(Locale.US, "%.1f", status.tokensPerSecond),
+                status.contextTokens
+            )
+            ComposerPhase.PREFILLING -> stringResource(
+                R.string.chat_status_prefill,
+                String.format(Locale.US, "%.1f", status.promptTokensPerSecond)
+            )
+            ComposerPhase.WAITING_FIRST_TOKEN -> stringResource(R.string.chat_status_generating)
+            null -> null
         }
-        if (status != null) {
+        if (statusText != null) {
             Spacer(modifier = Modifier.height(8.dp))
+            if (status?.phase == ComposerPhase.MODEL_LOADING) {
+                GLinearProgress(
+                    progress = status.progress,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp),
+                    height = 3.dp
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+            }
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .semantics {
+                        contentDescription = statusText
+                    },
                 horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -383,7 +524,7 @@ fun ChatInputBar(
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 GText(
-                    text = status,
+                    text = statusText,
                     style = GlassTheme.type.labelSmall.copy(
                         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
                     ),
@@ -405,16 +546,20 @@ fun ChatInputBar(
             color = GlassTheme.colors.onSurface
         )
 
+        if (pickerLaunching) {
+            GText(
+                text = stringResource(R.string.chat_attach_opening),
+                modifier = Modifier.padding(top = 8.dp),
+                style = GlassTheme.type.bodySmall,
+                color = GlassTheme.colors.onSurfaceVariant
+            )
+        }
+
         Spacer(modifier = Modifier.height(16.dp))
 
         GOptionRow(
-            onClick = {
-                imagePicker.launch(
-                    androidx.activity.result.PickVisualMediaRequest(
-                        ActivityResultContracts.PickVisualMedia.ImageOnly
-                    )
-                )
-            }
+            onClick = ::launchImagePicker,
+            enabled = !pickerLaunching
         ) {
             GIcon(
                 imageVector = GIcons.Add,
@@ -440,9 +585,8 @@ fun ChatInputBar(
         Spacer(modifier = Modifier.height(16.dp))
 
         GOptionRow(
-            onClick = {
-                documentPicker.launch(arrayOf("text/*", "application/pdf", "*/*"))
-            }
+            onClick = ::launchDocumentPicker,
+            enabled = !pickerLaunching
         ) {
             GIcon(
                 imageVector = GIcons.Description,
@@ -502,7 +646,7 @@ fun ChatInputBar(
                             color = GlassTheme.colors.onSurfaceVariant
                         )
                     }
-                    GIconButton(
+                    GCompactIconButton(
                         onClick = { onDeleteDocument(document.id) },
                         modifier = Modifier.size(32.dp)
                     ) {
@@ -513,9 +657,20 @@ fun ChatInputBar(
                             modifier = Modifier.size(15.dp)
                         )
                     }
-                    GSwitch(checked = included, onCheckedChange = { onToggleDocument(document.id) })
+                    GSwitch(
+                        checked = included,
+                        onCheckedChange = { onToggleDocument(document.id) },
+                        modifier = Modifier.semantics { contentDescription = document.name }
+                    )
                 }
             }
+        } else {
+            Spacer(modifier = Modifier.height(16.dp))
+            GText(
+                text = stringResource(R.string.chat_library_empty),
+                style = GlassTheme.type.bodySmall,
+                color = GlassTheme.colors.onSurfaceVariant
+            )
         }
 
         Spacer(modifier = Modifier.height(16.dp))

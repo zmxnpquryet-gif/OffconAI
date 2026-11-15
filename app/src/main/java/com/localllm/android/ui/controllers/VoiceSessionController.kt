@@ -344,6 +344,14 @@ internal class VoiceSessionController(
         runCatching { voiceManager.stopSpeaking() }
     }
 
+    suspend fun stopAllVoiceActivityAndJoin() {
+        val currentVoiceJob = voiceSessionJob
+        val currentOmniJob = nativeOmniJob
+        stopAllVoiceActivity()
+        currentVoiceJob?.join()
+        currentOmniJob?.join()
+    }
+
     fun release() {
         nativeOmniInput?.close()
         nativeOmniJob?.cancel()

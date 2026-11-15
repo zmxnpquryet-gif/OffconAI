@@ -5,6 +5,7 @@ import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.security.MessageDigest
+import java.util.PriorityQueue
 
 /**
  * End-to-end document RAG: extract, chunk, embed, persist, retrieve.
@@ -58,23 +59,37 @@ class DocumentIndex(context: Context) {
         // A new conversation has no selection: indexed files are reused only when the
         // user adds them from the library, exactly like a fresh attachment.
         if (query.isBlank() || documentIds.isEmpty()) return@withContext null
-        val stored = store.readForSearch().filter { it.docId in documentIds }
-        if (stored.isEmpty()) return@withContext null
+        if (maxChunks <= 0) return@withContext null
 
         val queryVector = embedder.embed(query)
         if (queryVector.all { it == 0f }) return@withContext null
 
-        val ranked = stored
-            .map { chunk -> chunk to embedder.similarity(queryVector, chunk.embedding) }
-            .filter { (_, score) -> score >= MIN_SIMILARITY }
-            .sortedByDescending { (_, score) -> score }
-
+        // Keep only the best candidates while the database cursor is open. The
+        // extra candidates let unreadable encrypted rows be skipped without losing
+        // fallback results, while memory remains independent of library size.
+        val ranked = PriorityQueue<Pair<DocumentStore.StoredChunk, Float>>(
+            compareBy { it.second }
+        )
+        store.forEachForSearch(documentIds) { chunk ->
+            val score = embedder.similarity(queryVector, chunk.embedding)
+            if (score >= MIN_SIMILARITY) {
+                if (ranked.size < MAX_RANKED_CHUNKS) {
+                    ranked.add(chunk to score)
+                } else {
+                    val lowestRankedScore = ranked.peek()?.second
+                    if (lowestRankedScore == null || score > lowestRankedScore) {
+                        ranked.poll()
+                        ranked.add(chunk to score)
+                    }
+                }
+            }
+        }
         if (ranked.isEmpty()) return@withContext null
 
         val builder = StringBuilder()
         var used = 0
         var included = 0
-        for ((chunk, _) in ranked) {
+        for ((chunk, _) in ranked.sortedByDescending { it.second }) {
             if (included >= maxChunks) break
             val text = store.decryptText(chunk) ?: continue
             if (included > 0 && used + text.length > maxChars) break
@@ -110,5 +125,6 @@ class DocumentIndex(context: Context) {
         private const val MAX_CONTEXT_CHUNKS = 4
         private const val MAX_CONTEXT_CHARS = 4000
         private const val MIN_SIMILARITY = 0.08f
+        private const val MAX_RANKED_CHUNKS = 128
     }
 }

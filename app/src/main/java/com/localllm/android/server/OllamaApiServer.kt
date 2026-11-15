@@ -14,6 +14,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
@@ -28,6 +29,7 @@ import java.net.Socket
 import java.nio.charset.StandardCharsets
 import java.security.SecureRandom
 import java.util.concurrent.Semaphore
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Hardened lightweight HTTP server running on port 11434 (Ollama & OpenAI protocols).
@@ -68,13 +70,15 @@ class OllamaApiServer(
 
         internal fun readHttpLine(
             input: InputStream,
-            deadlineNanos: Long = Long.MAX_VALUE
+            deadlineNanos: Long = Long.MAX_VALUE,
+            beforeRead: () -> Unit = {}
         ): String? {
             val bytes = ByteArrayOutputStream()
             while (true) {
                 if (System.nanoTime() > deadlineNanos) {
                     throw java.net.SocketTimeoutException("HTTP header phase timed out")
                 }
+                beforeRead()
                 val next = input.read()
                 if (next == -1) {
                     if (bytes.size() == 0) return null
@@ -91,7 +95,8 @@ class OllamaApiServer(
         internal fun readHttpBody(
             input: InputStream,
             contentLength: Int,
-            deadlineNanos: Long = Long.MAX_VALUE
+            deadlineNanos: Long = Long.MAX_VALUE,
+            beforeRead: () -> Unit = {}
         ): String {
             require(contentLength in 0..MAX_REQUEST_BODY_BYTES) { "Invalid body length" }
             val bytes = ByteArray(contentLength)
@@ -100,6 +105,7 @@ class OllamaApiServer(
                 if (System.nanoTime() > deadlineNanos) {
                     throw java.net.SocketTimeoutException("HTTP body phase timed out")
                 }
+                beforeRead()
                 val read = input.read(bytes, offset, minOf(contentLength - offset, 64 * 1024))
                 if (read < 0) throw EOFException("Incomplete HTTP body")
                 offset += read
@@ -143,7 +149,7 @@ class OllamaApiServer(
     @Volatile
     private var isRunning = false
     private var serverJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val generationSlots = Semaphore(MAX_CONCURRENT_GENERATIONS)
     private val connectionSlots = Semaphore(MAX_CONNECTIONS)
     private val preAuthSlots = Semaphore(MAX_PREAUTH_CONNECTIONS)
@@ -210,13 +216,21 @@ class OllamaApiServer(
                             Log.w(TAG, "Connection cap ($MAX_CONNECTIONS) hit, socket closed")
                             continue
                         }
-                        launch {
+                        val released = AtomicBoolean(false)
+                        fun releaseConnection() {
+                            runCatching { clientSocket.close() }
+                            if (released.compareAndSet(false, true)) connectionSlots.release()
+                        }
+                        val clientJob = launch {
                             try {
                                 handleClientSocket(clientSocket)
                             } finally {
-                                connectionSlots.release()
+                                releaseConnection()
                             }
                         }
+                        // A parent can be cancelled before the child starts running;
+                        // completion cleanup still closes the accepted socket and frees its slot.
+                        clientJob.invokeOnCompletion { releaseConnection() }
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
                         if (!isRunning) break
@@ -258,10 +272,20 @@ class OllamaApiServer(
             val input = socket.getInputStream().buffered()
             val output = socket.getOutputStream()
             val headerDeadline = System.nanoTime() + MAX_HEADER_PHASE_MS * 1_000_000L
+            val setHeaderReadTimeout = {
+                val remainingNanos = headerDeadline - System.nanoTime()
+                if (remainingNanos <= 0L) throw java.net.SocketTimeoutException("HTTP header phase timed out")
+                socket.soTimeout = ((remainingNanos + 999_999L) / 1_000_000L).coerceAtLeast(1L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            }
 
-            val requestLine = readHttpLine(input, headerDeadline) ?: return
-            val parts = requestLine.split(" ")
-            if (parts.size < 2) return
+            val requestLine = readHttpLine(input, headerDeadline, setHeaderReadTimeout) ?: return
+            val parts = requestLine.split(' ', limit = 3)
+            if (parts.size != 3 || parts[0].isBlank() || !parts[0].all { it in 'A'..'Z' } ||
+                !parts[1].startsWith('/') || parts[2] !in setOf("HTTP/1.0", "HTTP/1.1")
+            ) {
+                HttpWireWriter.sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Malformed HTTP request line\"}", null)
+                return
+            }
 
             val method = parts[0].uppercase()
             val uri = parts[1]
@@ -272,7 +296,11 @@ class OllamaApiServer(
             val headers = mutableMapOf<String, String>()
             var headerCount = 0
             while (true) {
-                val line = readHttpLine(input, headerDeadline) ?: break
+                val line = readHttpLine(input, headerDeadline, setHeaderReadTimeout)
+                    ?: run {
+                        HttpWireWriter.sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Incomplete HTTP headers\"}", headers["origin"])
+                        return
+                    }
                 if (line.isEmpty()) break
                 headerCount++
                 if (headerCount > MAX_HEADER_COUNT) {
@@ -280,23 +308,29 @@ class OllamaApiServer(
                     return
                 }
                 val colonIdx = line.indexOf(':')
-                if (colonIdx > 0) {
-                    val key = line.substring(0, colonIdx).trim().lowercase()
-                    val value = line.substring(colonIdx + 1).trim()
-                    headers[key] = value
-                    if (key == "content-length") {
-                        val parsed = value.toLongOrNull()
-                        when {
-                            parsed == null || parsed < 0 -> badContentLength = true
-                            contentLengthSeen && parsed != contentLength.toLong() -> badContentLength = true
-                            parsed > Int.MAX_VALUE -> {
-                                contentLength = MAX_REQUEST_BODY_BYTES + 1
-                                contentLengthSeen = true
-                            }
-                            else -> {
-                                contentLength = parsed.toInt()
-                                contentLengthSeen = true
-                            }
+                if (colonIdx <= 0) {
+                    HttpWireWriter.sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Malformed HTTP header\"}", headers["origin"])
+                    return
+                }
+                val key = line.substring(0, colonIdx).trim().lowercase()
+                val value = line.substring(colonIdx + 1).trim()
+                if (key.isBlank()) {
+                    HttpWireWriter.sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Malformed HTTP header\"}", headers["origin"])
+                    return
+                }
+                headers[key] = value
+                if (key == "content-length") {
+                    val parsed = value.toLongOrNull()
+                    when {
+                        parsed == null || parsed < 0 -> badContentLength = true
+                        contentLengthSeen && parsed != contentLength.toLong() -> badContentLength = true
+                        parsed > Int.MAX_VALUE -> {
+                            contentLength = MAX_REQUEST_BODY_BYTES + 1
+                            contentLengthSeen = true
+                        }
+                        else -> {
+                            contentLength = parsed.toInt()
+                            contentLengthSeen = true
                         }
                     }
                 }
@@ -307,8 +341,12 @@ class OllamaApiServer(
                 HttpWireWriter.sendResponse(output, 400, "Bad Request", "application/json", "{\"error\":\"Invalid Content-Length\"}", clientOrigin)
                 return
             }
-            if (headers["transfer-encoding"]?.contains("chunked", ignoreCase = true) == true) {
+            if (headers.containsKey("transfer-encoding")) {
                 HttpWireWriter.sendResponse(output, 411, "Length Required", "application/json", "{\"error\":\"Chunked request bodies are not supported\"}", clientOrigin)
+                return
+            }
+            if (headers["content-encoding"]?.equals("identity", ignoreCase = true) == false) {
+                HttpWireWriter.sendResponse(output, 415, "Unsupported Media Type", "application/json", "{\"error\":\"Compressed request bodies are not supported\"}", clientOrigin)
                 return
             }
             if (method == "OPTIONS") {
@@ -335,8 +373,19 @@ class OllamaApiServer(
                 HttpWireWriter.sendResponse(output, 413, "Content Too Large", "application/json", "{\"error\":\"Request body too large\"}", clientOrigin)
                 return
             }
+            val expect = headers["expect"]
+            if (expect != null && !expect.equals("100-continue", ignoreCase = true)) {
+                HttpWireWriter.sendResponse(output, 417, "Expectation Failed", "application/json", "{\"error\":\"Unsupported expectation\"}", clientOrigin)
+                return
+            }
+            if (expect != null && contentLength > 0) HttpWireWriter.sendContinue(output)
             val bodyDeadline = System.nanoTime() + MAX_BODY_PHASE_MS * 1_000_000L
-            val body = readHttpBody(input, contentLength, bodyDeadline)
+            val setBodyReadTimeout = {
+                val remainingNanos = bodyDeadline - System.nanoTime()
+                if (remainingNanos <= 0L) throw java.net.SocketTimeoutException("HTTP body phase timed out")
+                socket.soTimeout = ((remainingNanos + 999_999L) / 1_000_000L).coerceAtLeast(1L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            }
+            val body = readHttpBody(input, contentLength, bodyDeadline, setBodyReadTimeout)
             preAuthSlots.release()
             preAuthReleased = true
 
@@ -357,23 +406,32 @@ class OllamaApiServer(
         output: OutputStream,
         clientOrigin: String?
     ) {
+        val path = uri.substringBefore('?')
+        val knownPaths = setOf(
+            "/", "/api/tags", "/v1/models", "/api/show", "/api/version",
+            "/api/generate", "/api/chat", "/v1/chat/completions"
+        )
         when {
-            uri == "/" ->
+            path == "/" && method == "GET" ->
                 HttpWireWriter.sendResponse(output, 200, "OK", "text/plain", "Ollama is running on OffconAI\n", clientOrigin)
-            uri.startsWith("/api/tags") ->
+            (path == "/api/tags" || path == "/v1/models" || path == "/api/show" || path == "/api/version") && method == "GET" -> when (path) {
+                "/api/tags" ->
                 HttpWireWriter.sendResponse(output, 200, "OK", "application/json", ApiPayloadMapper.buildOllamaTagsJson(getAllModels(), getActiveModel()), clientOrigin)
-            uri.startsWith("/v1/models") ->
-                HttpWireWriter.sendResponse(output, 200, "OK", "application/json", ApiPayloadMapper.buildOpenAiModelsJson(getAllModels(), getActiveModel()), clientOrigin)
-            uri.startsWith("/api/show") ->
-                HttpWireWriter.sendResponse(output, 200, "OK", "application/json", ApiPayloadMapper.buildOllamaShowJson(getActiveModel(), getSettings()), clientOrigin)
-            uri.startsWith("/api/version") ->
-                HttpWireWriter.sendResponse(output, 200, "OK", "application/json", JSONObject().put("version", "0.5.1").toString(), clientOrigin)
-            uri.startsWith("/api/generate") && method == "POST" ->
+                "/v1/models" ->
+                    HttpWireWriter.sendResponse(output, 200, "OK", "application/json", ApiPayloadMapper.buildOpenAiModelsJson(getAllModels(), getActiveModel()), clientOrigin)
+                "/api/show" ->
+                    HttpWireWriter.sendResponse(output, 200, "OK", "application/json", ApiPayloadMapper.buildOllamaShowJson(getActiveModel(), getSettings()), clientOrigin)
+                else ->
+                    HttpWireWriter.sendResponse(output, 200, "OK", "application/json", JSONObject().put("version", "0.5.1").toString(), clientOrigin)
+            }
+            path == "/api/generate" && method == "POST" ->
                 handleOllamaCompletion(output, body, clientOrigin, chatFormat = false)
-            uri.startsWith("/api/chat") && method == "POST" ->
+            path == "/api/chat" && method == "POST" ->
                 handleOllamaCompletion(output, body, clientOrigin, chatFormat = true)
-            uri.startsWith("/v1/chat/completions") && method == "POST" ->
+            path == "/v1/chat/completions" && method == "POST" ->
                 handleOpenAiChat(output, body, clientOrigin)
+            path in knownPaths ->
+                HttpWireWriter.sendResponse(output, 405, "Method Not Allowed", "application/json", "{\"error\":\"Method not allowed\"}", clientOrigin)
             else -> {
                 val errorJson = JSONObject().put("error", "Endpoint not found: $uri").toString()
                 HttpWireWriter.sendResponse(output, 404, "Not Found", "application/json", errorJson, clientOrigin)
@@ -390,7 +448,12 @@ class OllamaApiServer(
         origin: String?,
         chatFormat: Boolean
     ) {
-        val json = runCatching { JSONObject(body) }.getOrElse { JSONObject() }
+        val json = try {
+            JSONObject(body)
+        } catch (_: Exception) {
+            HttpWireWriter.sendResponse(output, 400, "Bad Request", "application/json", JSONObject().put("error", "Request body must be a JSON object").toString(), origin)
+            return
+        }
         val isStream = json.optBoolean("stream", true)
         val modelName = getActiveModel()?.name ?: "local-model"
 
@@ -436,6 +499,8 @@ class OllamaApiServer(
             if (isStream) {
                 HttpWireWriter.sendStreamHeaders(output, "application/x-ndjson", origin)
                 var failed = false
+                val finalContent = StringBuilder()
+                val emittedContent = StringBuilder()
                 try {
                     llmEngine.streamGenerate(
                         prompt = prompt,
@@ -444,8 +509,20 @@ class OllamaApiServer(
                         attachment = null,
                         numPredictOverride = request.numPredict
                     ).collect { chunk ->
-                        if (chunk.token.isNotEmpty()) {
-                            HttpWireWriter.sendChunk(output, buildOllamaLine(chunk.token, done = false) + "\n")
+                        if (chunk.isComplete) {
+                            finalContent.setLength(0)
+                            finalContent.append(chunk.currentContentText)
+                        } else {
+                            finalContent.append(chunk.contentDelta)
+                        }
+                        val delta = if (chunk.isComplete) {
+                            ApiPayloadMapper.visibleStreamDelta(chunk.currentContentText, emittedContent.toString())
+                        } else {
+                            chunk.contentDelta.takeIf { it.isNotEmpty() }
+                        }
+                        if (delta != null) {
+                            HttpWireWriter.sendChunk(output, buildOllamaLine(delta, done = false) + "\n")
+                            emittedContent.append(delta)
                         }
                     }
                 } catch (e: Exception) {
@@ -459,6 +536,10 @@ class OllamaApiServer(
                     HttpWireWriter.sendChunk(output, buildOllamaLine("", done = true, error = errText) + "\n")
                 }
                 if (!failed) {
+                    val rest = ApiPayloadMapper.visibleStreamDelta(finalContent.toString(), emittedContent.toString())
+                    if (rest != null) {
+                        HttpWireWriter.sendChunk(output, buildOllamaLine(rest, done = false) + "\n")
+                    }
                     HttpWireWriter.sendChunk(output, buildOllamaLine("", done = true) + "\n")
                 }
                 HttpWireWriter.endChunk(output)
@@ -473,7 +554,12 @@ class OllamaApiServer(
                         attachment = null,
                         numPredictOverride = request.numPredict
                     ).collect { chunk ->
-                        if (chunk.token.isNotEmpty()) answer.append(chunk.token)
+                        if (chunk.isComplete) {
+                            answer.setLength(0)
+                            answer.append(chunk.currentContentText)
+                        } else {
+                            answer.append(chunk.contentDelta)
+                        }
                         totalTokens = chunk.totalTokens
                     }
                 } catch (e: Exception) {
@@ -496,7 +582,13 @@ class OllamaApiServer(
     }
 
     private suspend fun handleOpenAiChat(output: OutputStream, body: String, origin: String?) {
-        val json = runCatching { JSONObject(body) }.getOrElse { JSONObject() }
+        val json = try {
+            JSONObject(body)
+        } catch (_: Exception) {
+            val error = JSONObject().put("error", JSONObject().put("message", "Request body must be a JSON object")).toString()
+            HttpWireWriter.sendResponse(output, 400, "Bad Request", "application/json", error, origin)
+            return
+        }
         val isStream = json.optBoolean("stream", false)
         val activeModel = getActiveModel()
         val modelName = activeModel?.name ?: "local-model"
@@ -537,8 +629,10 @@ class OllamaApiServer(
         try {
             if (isStream) {
                 HttpWireWriter.sendStreamHeaders(output, "text/event-stream", origin)
-                var finalContentText = ""
-                var emittedVisibleLen = 0
+                val finalContentSb = StringBuilder()
+                val emittedContent = StringBuilder()
+                var emittedVisible = ""
+                var lastToolScanRawLength = 0
                 try {
                     llmEngine.streamGenerate(
                         prompt = lastUserPrompt,
@@ -548,20 +642,32 @@ class OllamaApiServer(
                         mcpToolsContext = toolsPrompt,
                         numPredictOverride = request.numPredict
                     ).collect { chunk ->
-                        finalContentText = chunk.currentContentText
-                        if (toolsPrompt == null) {
-                            if (chunk.token.isNotEmpty()) {
-                                HttpWireWriter.sendChunk(output, ApiPayloadMapper.buildOpenAiSseChunk(chatId, modelName, chunk.token, null))
-                            }
+                        if (chunk.isComplete) {
+                            finalContentSb.setLength(0)
+                            finalContentSb.append(chunk.currentContentText)
                         } else {
-                            val visible = McpToolProtocol.visibleText(finalContentText, toolDialect)
-                            if (visible.length > emittedVisibleLen && visible.startsWith(finalContentText.take(emittedVisibleLen).let { McpToolProtocol.visibleText(it, toolDialect) })) {
-                                val delta = visible.substring(emittedVisibleLen)
-                                if (delta.isNotEmpty()) {
-                                    HttpWireWriter.sendChunk(output, ApiPayloadMapper.buildOpenAiSseChunk(chatId, modelName, delta, null))
-                                }
-                                emittedVisibleLen = visible.length
+                            finalContentSb.append(chunk.contentDelta)
+                        }
+                        if (toolsPrompt == null) {
+                            val delta = if (chunk.isComplete) {
+                                ApiPayloadMapper.visibleStreamDelta(chunk.currentContentText, emittedContent.toString())
+                            } else {
+                                chunk.contentDelta.takeIf { it.isNotEmpty() }
                             }
+                            if (delta != null) {
+                                HttpWireWriter.sendChunk(output, ApiPayloadMapper.buildOpenAiSseChunk(chatId, modelName, delta, null))
+                                emittedContent.append(delta)
+                            }
+                        } else if (chunk.isComplete || finalContentSb.length - lastToolScanRawLength >= 128) {
+                            val visible = McpToolProtocol.stableVisiblePrefix(
+                                McpToolProtocol.visibleText(finalContentSb.toString(), toolDialect)
+                            )
+                            val delta = ApiPayloadMapper.visibleStreamDelta(visible, emittedVisible)
+                            if (delta != null) {
+                                HttpWireWriter.sendChunk(output, ApiPayloadMapper.buildOpenAiSseChunk(chatId, modelName, delta, null))
+                                emittedVisible = visible
+                            }
+                            lastToolScanRawLength = finalContentSb.length
                         }
                     }
                 } catch (e: Exception) {
@@ -576,6 +682,7 @@ class OllamaApiServer(
                     HttpWireWriter.endChunk(output)
                     return
                 }
+                val finalContentText = finalContentSb.toString()
                 val parsedBatch = if (toolsPrompt != null) {
                     McpToolProtocol.parseBatch(finalContentText, offeredTools, template = toolDialect)
                 } else null
@@ -583,9 +690,19 @@ class OllamaApiServer(
                     HttpWireWriter.sendChunk(output, ApiPayloadMapper.buildOpenAiToolCallSseChunk(chatId, modelName, parsedBatch.calls))
                     HttpWireWriter.sendChunk(output, ApiPayloadMapper.buildOpenAiSseChunk(chatId, modelName, null, "tool_calls"))
                 } else {
-                    if (toolsPrompt != null && finalContentText.length > emittedVisibleLen) {
-                        val rest = finalContentText.substring(emittedVisibleLen)
-                        if (rest.isNotEmpty()) {
+                    // Flush whatever visible text never made it into a delta (e.g. a
+                    // chunk where the visible prefix check failed). Diff against the
+                    // emitted visible text — never slice the raw text, which still
+                    // contains reasoning/tool markup at different offsets.
+                    if (toolsPrompt != null) {
+                        val tail = McpToolProtocol.visibleText(finalContentText, toolDialect)
+                        val rest = ApiPayloadMapper.visibleStreamDelta(tail, emittedVisible)
+                        if (rest != null) {
+                            HttpWireWriter.sendChunk(output, ApiPayloadMapper.buildOpenAiSseChunk(chatId, modelName, rest, null))
+                        }
+                    } else {
+                        val rest = ApiPayloadMapper.visibleStreamDelta(finalContentText, emittedContent.toString())
+                        if (rest != null) {
                             HttpWireWriter.sendChunk(output, ApiPayloadMapper.buildOpenAiSseChunk(chatId, modelName, rest, null))
                         }
                     }
@@ -594,7 +711,9 @@ class OllamaApiServer(
                 HttpWireWriter.sendChunk(output, "data: [DONE]\n\n")
                 HttpWireWriter.endChunk(output)
             } else {
-                var finalContentText = ""
+                // Deltas accumulate O(delta) per token; the isComplete chunk
+                // replaces them with the authoritative full text (finish() flush).
+                val finalContentSb = StringBuilder()
                 var totalTokens = 0
                 try {
                     llmEngine.streamGenerate(
@@ -605,7 +724,12 @@ class OllamaApiServer(
                         mcpToolsContext = toolsPrompt,
                         numPredictOverride = request.numPredict
                     ).collect { chunk ->
-                        finalContentText = chunk.currentContentText
+                        if (chunk.isComplete) {
+                            finalContentSb.setLength(0)
+                            finalContentSb.append(chunk.currentContentText)
+                        } else {
+                            finalContentSb.append(chunk.contentDelta)
+                        }
                         totalTokens = chunk.totalTokens
                     }
                 } catch (e: Exception) {
@@ -621,13 +745,19 @@ class OllamaApiServer(
                     HttpWireWriter.sendResponse(output, status, statusLabel, "application/json", err, origin)
                     return
                 }
+                val finalContentText = finalContentSb.toString()
                 val parsedBatch = if (toolsPrompt != null) {
                     McpToolProtocol.parseBatch(finalContentText, offeredTools, template = toolDialect)
                 } else null
                 val responseBody = if (parsedBatch != null && parsedBatch.calls.isNotEmpty()) {
                     ApiPayloadMapper.buildOpenAiCompletionJson(chatId, modelName, parsedBatch.prose, totalTokens, parsedBatch.calls)
                 } else {
-                    ApiPayloadMapper.buildOpenAiCompletionJson(chatId, modelName, finalContentText, totalTokens)
+                    val visible = if (toolsPrompt != null) {
+                        McpToolProtocol.visibleText(finalContentText, toolDialect)
+                    } else {
+                        finalContentText
+                    }
+                    ApiPayloadMapper.buildOpenAiCompletionJson(chatId, modelName, visible, totalTokens)
                 }
                 HttpWireWriter.sendResponse(
                     output,

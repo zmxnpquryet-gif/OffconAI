@@ -6,9 +6,18 @@ use crate::contracts::{ChatRequest, StreamEvent, ToolCallRecord};
 use reqwest::blocking::{Client, Response};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+const MAX_BUFFERED_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+const MAX_SSE_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
+// Keep aligned with the session/controller per-response limit so excess calls
+// fail the turn visibly instead of being silently dropped from history.
+const MAX_TOOL_CALLS: usize = 4;
+const MAX_ASSEMBLED_TOOL_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct OpenAiTransport {
     client: Client,
@@ -58,15 +67,42 @@ impl OpenAiTransport {
         };
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().unwrap_or_default();
-            listener(StreamEvent::Error(format!("HTTP {status}: {body}")));
+            let (body, _) = match read_limited_body(response, MAX_ERROR_BODY_BYTES) {
+                Ok(body) => body,
+                Err(error) => {
+                    listener(StreamEvent::Error(format!(
+                        "HTTP {status}: response body could not be read: {error}"
+                    )));
+                    return;
+                }
+            };
+            listener(StreamEvent::Error(format!(
+                "HTTP {status}: {}",
+                truncate_error_body(&String::from_utf8_lossy(&body))
+            )));
             return;
         }
         if request.stream {
             read_stream(response, cancel, listener);
         } else {
-            let body = response.text().unwrap_or_default();
+            let (body, truncated) = match read_limited_body(response, MAX_BUFFERED_RESPONSE_BYTES) {
+                Ok(body) => body,
+                Err(error) => {
+                    listener(StreamEvent::Error(format!(
+                        "response body could not be read: {error}"
+                    )));
+                    return;
+                }
+            };
+            if truncated {
+                listener(StreamEvent::Error(format!(
+                    "non-streaming response exceeded the {} MiB limit",
+                    MAX_BUFFERED_RESPONSE_BYTES / (1024 * 1024)
+                )));
+                return;
+            }
             let mut assembler = ToolCallAssembler::default();
+            let body = String::from_utf8_lossy(&body);
             let errored = parse_payload(&body, &mut assembler, listener);
             assembler.flush(listener);
             if !errored {
@@ -163,7 +199,14 @@ pub fn models_url(base_url: &str) -> String {
 }
 
 pub fn health_url(base_url: &str) -> String {
-    format!("{}/health", strip_slash(base_url))
+    let base = strip_slash(base_url);
+    let base = base
+        .strip_suffix("/v1/chat/completions")
+        .or_else(|| base.strip_suffix("/chat/completions"))
+        .or_else(|| base.strip_suffix("/v1"))
+        .unwrap_or(&base)
+        .trim_end_matches('/');
+    format!("{base}/health")
 }
 
 fn strip_slash(value: &str) -> String {
@@ -182,22 +225,40 @@ struct PartialToolCall {
 #[derive(Default)]
 struct ToolCallAssembler {
     slots: BTreeMap<usize, PartialToolCall>,
+    total_bytes: usize,
 }
 
 impl ToolCallAssembler {
-    fn ingest(&mut self, calls: &[Value]) {
+    fn ingest(&mut self, calls: &[Value]) -> Result<(), &'static str> {
         for (fallback_idx, item) in calls.iter().enumerate() {
-            let index = item
-                .get("index")
-                .and_then(Value::as_u64)
-                .map(|idx| idx as usize)
-                .unwrap_or(fallback_idx);
+            let index = match item.get("index") {
+                Some(value) => {
+                    let raw = value
+                        .as_u64()
+                        .ok_or("stream contained an invalid tool-call index")?;
+                    usize::try_from(raw)
+                        .map_err(|_| "stream tool-call index exceeds the supported range")?
+                }
+                None => fallback_idx,
+            };
+            if index >= MAX_TOOL_CALLS {
+                return Err("stream exceeded the supported tool-call count");
+            }
+            if !self.slots.contains_key(&index) && self.slots.len() >= MAX_TOOL_CALLS {
+                return Err("stream exceeded the supported tool-call count");
+            }
             let slot = self.slots.entry(index).or_default();
             if let Some(id) = item
                 .get("id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
             {
+                self.total_bytes = self
+                    .total_bytes
+                    .saturating_add(id.len().saturating_sub(slot.id.as_ref().map_or(0, String::len)));
+                if self.total_bytes > MAX_ASSEMBLED_TOOL_BYTES {
+                    return Err("streamed tool-call data exceeded the size limit");
+                }
                 slot.id = Some(id.to_string());
             }
             if let Some(function) = item.get("function") {
@@ -206,6 +267,10 @@ impl ToolCallAssembler {
                     .and_then(Value::as_str)
                     .filter(|name| !name.is_empty())
                 {
+                    self.total_bytes = self.total_bytes.saturating_add(name.len());
+                    if self.total_bytes > MAX_ASSEMBLED_TOOL_BYTES {
+                        return Err("streamed tool-call data exceeded the size limit");
+                    }
                     slot.name.push_str(name);
                 }
                 if let Some(args) = function
@@ -213,10 +278,15 @@ impl ToolCallAssembler {
                     .and_then(Value::as_str)
                     .filter(|args| !args.is_empty())
                 {
+                    self.total_bytes = self.total_bytes.saturating_add(args.len());
+                    if self.total_bytes > MAX_ASSEMBLED_TOOL_BYTES {
+                        return Err("streamed tool-call data exceeded the size limit");
+                    }
                     slot.arguments.push_str(args);
                 }
             }
         }
+        Ok(())
     }
 
     fn flush(&mut self, listener: &mut dyn FnMut(StreamEvent)) {
@@ -239,16 +309,21 @@ fn read_stream(response: Response, cancel: &AtomicBool, listener: &mut dyn FnMut
     let mut reader = BufReader::new(response);
     let mut assembler = ToolCallAssembler::default();
     let mut line = String::new();
+    let mut event_data = String::new();
     loop {
         if cancel.load(Ordering::SeqCst) {
             break;
         }
         line.clear();
-        match reader.read_line(&mut line) {
+        match reader
+            .by_ref()
+            .take((MAX_SSE_LINE_BYTES + 1) as u64)
+            .read_line(&mut line)
+        {
             Ok(0) => break,
             Ok(_) => {}
             Err(error) => {
-                if !cancel.load(Ordering::Relaxed) {
+                if !cancel.load(Ordering::SeqCst) {
                     listener(StreamEvent::Error(format!(
                         "stream read failed: {error}"
                     )));
@@ -256,22 +331,75 @@ fn read_stream(response: Response, cancel: &AtomicBool, listener: &mut dyn FnMut
                 return;
             }
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with(':') {
+        if line.len() > MAX_SSE_LINE_BYTES {
+            listener(StreamEvent::Error("stream line exceeded the size limit".into()));
+            return;
+        }
+        let line = line.trim_end_matches(|ch| ch == '\r' || ch == '\n');
+        if line.is_empty() {
+            if !event_data.is_empty() {
+                if dispatch_event(&event_data, &mut assembler, listener) {
+                    return;
+                }
+                event_data.clear();
+            }
             continue;
         }
-        let payload = trimmed.strip_prefix("data:").unwrap_or(trimmed).trim();
-        if payload == "[DONE]" {
-            assembler.flush(listener);
-            listener(StreamEvent::Done);
+        if line.starts_with(':') {
+            continue;
+        }
+        let Some(payload) = line.strip_prefix("data:") else {
+            // Ignore non-data SSE lines (e.g. event: ping, id: 123, retry: 1000)
+            continue;
+        };
+        let payload = payload.strip_prefix(' ').unwrap_or(payload);
+        let next_len = event_data
+            .len()
+            .saturating_add(payload.len())
+            .saturating_add(if event_data.is_empty() { 0 } else { 1 });
+        if next_len > MAX_SSE_EVENT_BYTES {
+            listener(StreamEvent::Error("stream event exceeded the size limit".into()));
             return;
         }
-        if parse_payload(payload, &mut assembler, listener) {
-            return;
+        if !event_data.is_empty() {
+            event_data.push('\n');
         }
+        event_data.push_str(payload);
+    }
+    if !event_data.is_empty() && dispatch_event(&event_data, &mut assembler, listener) {
+        return;
     }
     assembler.flush(listener);
     listener(StreamEvent::Done);
+}
+
+fn dispatch_event(
+    payload: &str,
+    assembler: &mut ToolCallAssembler,
+    listener: &mut dyn FnMut(StreamEvent),
+) -> bool {
+    let payload = payload.trim();
+    if payload == "[DONE]" {
+        assembler.flush(listener);
+        listener(StreamEvent::Done);
+        return true;
+    }
+    parse_payload(payload, assembler, listener)
+}
+
+/// Reads at most `limit + 1` bytes so oversized responses can be rejected without
+/// buffering the rest of an untrusted or unexpectedly large body.
+fn read_limited_body(
+    response: Response,
+    limit: usize,
+) -> Result<(Vec<u8>, bool), std::io::Error> {
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    response
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > limit;
+    bytes.truncate(limit);
+    Ok((bytes, truncated))
 }
 
 /// Returns true when a terminal error event was emitted.
@@ -305,7 +433,10 @@ fn parse_payload(
         .and_then(|d| d.get("tool_calls"))
         .and_then(Value::as_array)
     {
-        assembler.ingest(tool_calls);
+        if let Err(error) = assembler.ingest(tool_calls) {
+            listener(StreamEvent::Error(error.into()));
+            return true;
+        }
     }
 
     let text = delta
@@ -318,6 +449,8 @@ fn parse_payload(
             delta
                 .get("reasoning_content")
                 .or_else(|| delta.get("reasoning"))
+                .or_else(|| delta.get("thought"))
+                .or_else(|| delta.get("thinking"))
         })
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
@@ -326,6 +459,20 @@ fn parse_payload(
         listener(StreamEvent::Delta { text, reasoning });
     }
     false
+}
+
+/// Error pages (e.g. proxy HTML) can be megabytes; keep the status line useful.
+fn truncate_error_body(body: &str) -> String {
+    const LIMIT: usize = 500;
+    let trimmed = body.trim();
+    if trimmed.len() <= LIMIT {
+        return trimmed.to_string();
+    }
+    let mut end = LIMIT;
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... (truncated)", trimmed[..end].trim_end())
 }
 
 fn error_text(value: &Value) -> Option<String> {
@@ -430,6 +577,23 @@ mod tests {
             health_url("http://127.0.0.1:8080/"),
             "http://127.0.0.1:8080/health"
         );
+        assert_eq!(
+            health_url("http://127.0.0.1:8000/v1"),
+            "http://127.0.0.1:8000/health"
+        );
+        assert_eq!(
+            health_url("http://127.0.0.1:8000/v1/chat/completions"),
+            "http://127.0.0.1:8000/health"
+        );
+    }
+
+    #[test]
+    fn error_bodies_are_truncated_for_status_display() {
+        assert_eq!(truncate_error_body("oops"), "oops");
+        let long = "e".repeat(600);
+        let shown = truncate_error_body(&long);
+        assert!(shown.len() < long.len());
+        assert!(shown.ends_with("(truncated)"));
     }
 
     #[test]

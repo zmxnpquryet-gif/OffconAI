@@ -215,4 +215,21 @@ class ReasoningStreamParserTest {
         assertEquals("Need a tool\n", unclosedThinkParser.reasoningBuffer.toString())
         assertEquals("<tool_call>{\"name\":\"add\",\"arguments\":{}}</tool_call>", unclosedThinkParser.contentBuffer.toString())
     }
+
+    @Test
+    fun `thought and thinking tags route to reasoning`() {
+        val thoughtParser = ReasoningStreamParser()
+        thoughtParser.processChunk("<thought>analyzing user intent</thought>Here is the plan.")
+        thoughtParser.finish()
+        assertFalse(thoughtParser.isInReasoningMode)
+        assertEquals("analyzing user intent", thoughtParser.reasoningBuffer.toString())
+        assertEquals("Here is the plan.", thoughtParser.contentBuffer.toString())
+
+        val thinkingParser = ReasoningStreamParser()
+        thinkingParser.processChunk("<thinking>pondering deeply</thinking>Solution.")
+        thinkingParser.finish()
+        assertFalse(thinkingParser.isInReasoningMode)
+        assertEquals("pondering deeply", thinkingParser.reasoningBuffer.toString())
+        assertEquals("Solution.", thinkingParser.contentBuffer.toString())
+    }
 }

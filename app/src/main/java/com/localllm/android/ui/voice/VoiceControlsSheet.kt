@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -21,6 +22,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -108,7 +114,11 @@ internal fun TtsEngineCard(
                 color = if (selected) GlassTheme.colors.primary else GlassTheme.colors.outline,
                 shape = RoundedCornerShape(10.dp)
             )
-            .clickable(onClick = onClick)
+            .semantics {
+                contentDescription = title
+                this.selected = selected
+            }
+            .clickable(role = Role.RadioButton, onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 8.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -159,23 +169,35 @@ internal fun TtsVoiceControls(
                 color = GlassTheme.colors.onSurfaceVariant
             )
             Spacer(modifier = Modifier.width(6.dp))
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                 items(LocalTtsEngine.SPEAKER_COUNT) { index ->
                     val active = index == speakerId
+                    val speakerLabel = stringResource(R.string.voice_tts_speaker_item, index + 1)
                     Box(
                         modifier = Modifier
-                            .size(24.dp)
-                            .clip(CircleShape)
-                            .background(if (active) GlassTheme.colors.primary else GlassTheme.colors.surfaceVariant)
-                            .clickable { onSpeakerChange(index) },
+                            .size(48.dp)
+                            .semantics { contentDescription = speakerLabel }
+                            .toggleable(
+                                value = active,
+                                role = Role.RadioButton,
+                                onValueChange = { onSpeakerChange(index) }
+                            ),
                         contentAlignment = Alignment.Center
                     ) {
-                        GText(
-                            text = "${index + 1}",
-                            fontSize = 10.sp,
-                            fontFamily = FontFamily.Monospace,
-                            color = if (active) GlassTheme.colors.onPrimary else GlassTheme.colors.onSurface
-                        )
+                        Box(
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(CircleShape)
+                                .background(if (active) GlassTheme.colors.primary else GlassTheme.colors.surfaceVariant),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            GText(
+                                text = "${index + 1}",
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = if (active) GlassTheme.colors.onPrimary else GlassTheme.colors.onSurface
+                            )
+                        }
                     }
                 }
             }
@@ -199,10 +221,10 @@ internal fun TtsVoiceControls(
                     steps = 14
                 )
             }
-            GTextButton(onClick = onPreview) {
+            GTextButton(onClick = onPreview, modifier = Modifier.heightIn(min = 48.dp)) {
                 GText(text = stringResource(R.string.voice_tts_preview), color = GlassTheme.colors.primary, fontSize = 12.sp)
             }
-            GTextButton(onClick = onDelete) {
+            GTextButton(onClick = onDelete, modifier = Modifier.heightIn(min = 48.dp)) {
                 GText(text = stringResource(R.string.voice_stt_delete), color = GlassTheme.colors.onSurfaceVariant, fontSize = 12.sp)
             }
         }

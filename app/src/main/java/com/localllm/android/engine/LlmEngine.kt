@@ -28,12 +28,18 @@ import java.io.File
 data class GenerationChunk(
     val token: String,
     val isReasoning: Boolean,
+    /** Full-buffer snapshot; populated on completion, empty on incremental chunks. */
     val currentReasoningText: String,
+    /** Full-buffer snapshot; populated on completion, empty on incremental chunks. */
     val currentContentText: String,
     val tps: Float,
     val promptSpeed: Float,
     val totalTokens: Int,
-    val isComplete: Boolean = false
+    val isComplete: Boolean = false,
+    /** Incremental consumers append this on non-final chunks instead of copying snapshots. */
+    val contentDelta: String = "",
+    /** Incremental reasoning text committed since the previous chunk. */
+    val reasoningDelta: String = ""
 )
 
 /**

@@ -4,7 +4,10 @@ use crate::contracts::{
     BackendCapabilities, BackendKind, ChatRequest, LlmBackend, ModelSpec, ResourceSnapshot,
     StreamEvent,
 };
-use crate::process::{log_path, log_tail, spawn_with_log, wait_for, ProcessSlot};
+use crate::process::{
+    log_path, log_tail, sanitize_path, spawn_with_log, wait_for_process_health, ProcessSlot,
+    WaitOutcome,
+};
 use crate::transport::OpenAiTransport;
 use std::path::PathBuf;
 use std::process::Command;
@@ -74,6 +77,7 @@ impl LlmBackend for Strata {
     }
 
     fn load(&self, model: &ModelSpec) -> Result<(), String> {
+        self.unload();
         if self.config.base_url.trim().is_empty() {
             return Err(
                 "Strata adapter requires a configured OpenAI-compatible gateway endpoint".into(),
@@ -82,28 +86,41 @@ impl LlmBackend for Strata {
         let served = model.effective_served_id().to_string();
 
         if !self.config.launch_command.is_empty() {
-            self.unload();
-            let mut command = Command::new(&self.config.launch_command[0]);
+            let executable = sanitize_path(&self.config.launch_command[0]);
+            if executable.is_empty() {
+                return Err("Strata launch command has an empty executable path".into());
+            }
+            let mut command = Command::new(executable);
             command.args(&self.config.launch_command[1..]);
             command.args(&self.config.extra_args);
             if let Some(directory) = &self.config.working_directory {
+                let directory = sanitize_path(&directory.to_string_lossy());
                 command.current_dir(directory);
             }
             let log = log_path("strata.log");
             let child = spawn_with_log(command, &log)?;
             self.slot.store_child(child, log.clone());
             self.slot.set_loaded(&served);
-            if !wait_for(Duration::from_secs(30), || {
-                self.slot.alive()
-                    && self
-                        .transport
-                        .models_available(&self.config.base_url, self.config.api_key.as_deref())
+            match wait_for_process_health(Duration::from_secs(30), &self.slot, || {
+                self.transport
+                    .models_available(&self.config.base_url, self.config.api_key.as_deref())
             }) {
-                let tail = log_tail(Some(&log), 20);
-                self.slot.clear();
-                return Err(format!(
-                    "Launched Strata command did not answer /v1/models. {tail}"
-                ));
+                WaitOutcome::Success => {}
+                WaitOutcome::ProcessExited(code) => {
+                    let tail = log_tail(Some(&log), 20);
+                    self.slot.clear();
+                    let code_str = code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
+                    return Err(format!(
+                        "Launched Strata process exited prematurely with code {code_str}. {tail}"
+                    ));
+                }
+                WaitOutcome::TimedOut => {
+                    let tail = log_tail(Some(&log), 20);
+                    self.slot.clear();
+                    return Err(format!(
+                        "Launched Strata command did not answer /v1/models within 30s. {tail}"
+                    ));
+                }
             }
             return Ok(());
         }
@@ -132,6 +149,19 @@ impl LlmBackend for Strata {
         cancel: &AtomicBool,
         listener: &mut dyn FnMut(StreamEvent),
     ) {
+        let has_managed_child = self.slot.has_child_process();
+        if self.slot.loaded().is_none() && !has_managed_child {
+            listener(StreamEvent::Error(
+                "Strata backend is not loaded — press Load first.".into(),
+            ));
+            return;
+        }
+        if has_managed_child && !self.slot.alive() {
+            listener(StreamEvent::Error(
+                "The managed Strata process exited — press Load to restart it.".into(),
+            ));
+            return;
+        }
         let loaded = self.slot.loaded();
         let fallback_model = loaded.as_deref().or_else(|| {
             let configured = self.config.model_id.trim();

@@ -2,7 +2,7 @@
 
 import { ScrollView } from "std-widgets.slint";
 import { Ui } from "theme.slint";
-import { Card, CheckRow, Field, FieldLabel, FlatButton, SectionLabel, StatusDot } from "widgets.slint";
+import { Card, CheckRow, CompactButton, Field, FieldLabel, FlatButton, SectionLabel, StatusDot, TextArea } from "widgets.slint";
 
 export component RuntimeSidebar inherits Rectangle {
     in property <int> backend-index;
@@ -12,6 +12,7 @@ export component RuntimeSidebar inherits Rectangle {
     in property <string> mcp-status;
 
     in-out property <string> model-label;
+    in-out property <string> system-prompt;
     in-out property <string> llama-executable;
     in-out property <string> llama-model-path;
     in-out property <string> llama-port;
@@ -37,6 +38,7 @@ export component RuntimeSidebar inherits Rectangle {
     callback new-chat-requested();
     callback mcp-connect-requested();
     callback mcp-disconnect-requested();
+    callback apply-preset(int);
 
     width: 300px;
     background: transparent;
@@ -65,9 +67,49 @@ export component RuntimeSidebar inherits Rectangle {
                         FieldLabel { text: "Model label / served id"; }
                         Field {
                             text <=> root.model-label;
+                            field-label: "Model label / served id";
                             placeholder: "local-model";
                             field-enabled: !root.busy;
                             monospace: true;
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        FieldLabel { text: "System prompt (optional)"; }
+                        TextArea {
+                            text <=> root.system-prompt;
+                            field-label: "System prompt";
+                            placeholder: "You are a helpful, expert AI assistant.";
+                            field-enabled: !root.busy;
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        FieldLabel { text: "Quick Presets"; }
+                        HorizontalLayout {
+                            spacing: 4px;
+                            CompactButton {
+                                label: "Qwen 3.5";
+                                button-enabled: !root.busy;
+                                clicked => { root.apply-preset(0); }
+                            }
+                            CompactButton {
+                                label: "LFM3";
+                                button-enabled: !root.busy;
+                                clicked => { root.apply-preset(1); }
+                            }
+                            CompactButton {
+                                label: "Gemma 4";
+                                button-enabled: !root.busy;
+                                clicked => { root.apply-preset(2); }
+                            }
+                            CompactButton {
+                                label: "DeepSeek";
+                                button-enabled: !root.busy;
+                                clicked => { root.apply-preset(3); }
+                            }
                         }
                     }
 
@@ -113,6 +155,7 @@ export component RuntimeSidebar inherits Rectangle {
                             FieldLabel { text: "llama-server binary"; }
                             Field {
                                 text <=> root.llama-executable;
+                                field-label: "llama-server binary";
                                 placeholder: "llama-server";
                                 field-enabled: !root.busy;
                                 monospace: true;
@@ -123,6 +166,7 @@ export component RuntimeSidebar inherits Rectangle {
                             FieldLabel { text: "GGUF model path"; }
                             Field {
                                 text <=> root.llama-model-path;
+                                field-label: "GGUF model path";
                                 placeholder: "C:\\models\\model.gguf";
                                 field-enabled: !root.busy;
                                 monospace: true;
@@ -136,6 +180,7 @@ export component RuntimeSidebar inherits Rectangle {
                                 FieldLabel { text: "Port"; }
                                 Field {
                                     text <=> root.llama-port;
+                                    field-label: "llama.cpp port";
                                     placeholder: "8080";
                                     field-enabled: !root.busy;
                                     monospace: true;
@@ -147,6 +192,7 @@ export component RuntimeSidebar inherits Rectangle {
                                 FieldLabel { text: "Context"; }
                                 Field {
                                     text <=> root.llama-context-size;
+                                    field-label: "Context size";
                                     placeholder: "4096";
                                     field-enabled: !root.busy;
                                     monospace: true;
@@ -158,6 +204,7 @@ export component RuntimeSidebar inherits Rectangle {
                                 FieldLabel { text: "GPU layers"; }
                                 Field {
                                     text <=> root.llama-gpu-layers;
+                                    field-label: "GPU layers";
                                     placeholder: "0";
                                     field-enabled: !root.busy;
                                     monospace: true;
@@ -173,6 +220,7 @@ export component RuntimeSidebar inherits Rectangle {
                             FieldLabel { text: "Endpoint"; }
                             Field {
                                 text <=> root.vllm-endpoint;
+                                field-label: "vLLM endpoint";
                                 placeholder: "http://127.0.0.1:8000";
                                 field-enabled: !root.busy;
                                 monospace: true;
@@ -183,6 +231,7 @@ export component RuntimeSidebar inherits Rectangle {
                             FieldLabel { text: "Model path / Hugging Face id"; }
                             Field {
                                 text <=> root.vllm-model-path;
+                                field-label: "Model path or Hugging Face id";
                                 placeholder: "Qwen/Qwen3.5-4B-Instruct";
                                 field-enabled: !root.busy;
                                 monospace: true;
@@ -196,6 +245,7 @@ export component RuntimeSidebar inherits Rectangle {
                                 FieldLabel { text: "Port"; }
                                 Field {
                                     text <=> root.vllm-port;
+                                    field-label: "vLLM port";
                                     placeholder: "8000";
                                     field-enabled: !root.busy;
                                     monospace: true;
@@ -221,6 +271,7 @@ export component RuntimeSidebar inherits Rectangle {
                             FieldLabel { text: "Gateway endpoint"; }
                             Field {
                                 text <=> root.strata-endpoint;
+                                field-label: "Gateway endpoint";
                                 placeholder: "http://127.0.0.1:9000";
                                 field-enabled: !root.busy;
                                 monospace: true;
@@ -231,6 +282,7 @@ export component RuntimeSidebar inherits Rectangle {
                             FieldLabel { text: "Launch command (optional)"; }
                             Field {
                                 text <=> root.strata-launch;
+                                field-label: "Launch command";
                                 placeholder: "strata serve --port 9000";
                                 field-enabled: !root.busy;
                                 monospace: true;
@@ -259,6 +311,7 @@ export component RuntimeSidebar inherits Rectangle {
                         FieldLabel { text: "MCP server URL"; }
                         Field {
                             text <=> root.mcp-url;
+                            field-label: "MCP server URL";
                             placeholder: "http://127.0.0.1:3000/mcp";
                             field-enabled: !root.busy;
                             monospace: true;
@@ -269,9 +322,11 @@ export component RuntimeSidebar inherits Rectangle {
                         FieldLabel { text: "Bearer token (optional)"; }
                         Field {
                             text <=> root.mcp-token;
+                            field-label: "MCP bearer token";
                             placeholder: "token";
                             field-enabled: !root.busy;
                             monospace: true;
+                            secret: true;
                         }
                     }
                     HorizontalLayout {
@@ -331,6 +386,7 @@ export component RuntimeSidebar inherits Rectangle {
                         FieldLabel { text: "Temperature"; }
                         Field {
                             text <=> root.temperature-text;
+                            field-label: "Temperature";
                             placeholder: "0.7";
                             field-enabled: !root.busy;
                             monospace: true;
@@ -342,6 +398,7 @@ export component RuntimeSidebar inherits Rectangle {
                         FieldLabel { text: "Max tokens"; }
                         Field {
                             text <=> root.max-tokens-text;
+                            field-label: "Maximum tokens";
                             placeholder: "1024";
                             field-enabled: !root.busy;
                             monospace: true;

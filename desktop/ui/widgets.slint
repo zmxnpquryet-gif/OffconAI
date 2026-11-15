@@ -1,5 +1,6 @@
 // OffconAI Desktop — Reusable flat instrument primitives.
 
+import { ScrollView } from "std-widgets.slint";
 import { Ui } from "theme.slint";
 
 export component Glyph inherits Rectangle {
@@ -66,9 +67,11 @@ export component FieldLabel inherits Text {
 
 export component Field inherits Rectangle {
     in-out property <string> text;
+    in property <string> field-label: "";
     in property <string> placeholder;
     in property <bool> field-enabled: true;
     in property <bool> monospace: false;
+    in property <bool> secret: false;
 
     height: 34px;
     border-radius: 8px;
@@ -86,6 +89,7 @@ export component Field inherits Rectangle {
         font-family: root.monospace ? Ui.font-mono : Ui.font-sans;
         vertical-alignment: center;
         overflow: elide;
+        accessible-role: none;
     }
 
     input := TextInput {
@@ -102,6 +106,133 @@ export component Field inherits Rectangle {
         selection-foreground-color: #FFFFFF;
         font-size: 12px;
         font-family: root.monospace ? Ui.font-mono : Ui.font-sans;
+        input-type: root.secret ? InputType.password : InputType.text;
+        accessible-label: root.field-label.is-empty ? root.placeholder : root.field-label;
+        accessible-placeholder-text: root.placeholder;
+    }
+}
+
+export component TextArea inherits Rectangle {
+    in-out property <string> text;
+    in property <string> field-label;
+    in property <string> placeholder;
+    in property <bool> field-enabled: true;
+
+    height: 88px;
+    border-radius: 8px;
+    background: root.field-enabled ? Ui.surface : Ui.raised;
+    border-width: 1px;
+    border-color: text-input.has-focus ? Ui.accent : Ui.hairline;
+
+    Text {
+        x: 10px;
+        y: 8px;
+        width: parent.width - 20px;
+        height: 20px;
+        text: root.text.is-empty ? root.placeholder : "";
+        color: Ui.muted;
+        font-size: 12px;
+        vertical-alignment: top;
+        wrap: TextWrap.word-wrap;
+        accessible-role: none;
+    }
+
+    editor := ScrollView {
+        x: 10px;
+        y: 8px;
+        width: parent.width - 20px;
+        height: parent.height - 16px;
+        vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+        horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+        content-width: self.visible-width;
+        content-height: max(self.visible-height, text-input.preferred-height);
+
+        text-input := TextInput {
+            width: editor.visible-width;
+            height: max(editor.visible-height, self.preferred-height);
+            vertical-alignment: top;
+            single-line: false;
+            wrap: TextWrap.word-wrap;
+            page-height: editor.visible-height;
+            enabled: root.field-enabled;
+            text <=> root.text;
+            color: Ui.text;
+            selection-background-color: Ui.accent;
+            selection-foreground-color: #FFFFFF;
+            font-size: 12px;
+            accessible-label: root.field-label;
+            accessible-placeholder-text: root.placeholder;
+            cursor-position-changed(cpos) => {
+                if (cpos.y + editor.content-y < 0px) {
+                    editor.content-y = min(
+                        0px,
+                        editor.visible-height - cpos.y - 20px,
+                        max(editor.visible-height - self.height, -cpos.y),
+                    );
+                } else if (cpos.y + editor.content-y > editor.visible-height - 20px) {
+                    editor.content-y = min(
+                        0px,
+                        max(editor.visible-height - self.height, editor.visible-height - cpos.y - 20px),
+                    );
+                }
+            }
+        }
+    }
+}
+
+export component CompactButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> button-enabled: true;
+    callback clicked();
+
+    forward-focus: key-focus;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.button-enabled;
+    accessible-action-default => {
+        if (root.button-enabled) { root.clicked(); }
+    }
+
+    height: 24px;
+    min-width: btn-txt.preferred-width + 16px;
+    border-radius: 6px;
+    background: !root.button-enabled ? Ui.raised : touch.pressed ? Ui.raised : touch.has-hover ? Ui.hover-surface : Ui.surface;
+    border-width: 1px;
+    border-color: key-focus.has-focus ? Ui.accent : Ui.hairline;
+
+    btn-txt := Text {
+        width: 100%;
+        height: 100%;
+        text: root.label;
+        color: root.button-enabled ? Ui.text : Ui.muted;
+        font-size: 11px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+
+    touch := TouchArea {
+        enabled: root.button-enabled;
+        mouse-cursor: root.button-enabled ? pointer : default;
+        clicked => {
+            if (root.button-enabled) {
+                key-focus.focus();
+                root.clicked();
+            }
+        }
+    }
+
+    key-focus := FocusScope {
+        x: 0;
+        width: 0px;
+        enabled: root.button-enabled;
+        key-pressed(event) => {
+            if (event.text == Key.Space || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
     }
 }
 
@@ -111,14 +242,22 @@ export component FlatButton inherits Rectangle {
     in property <bool> button-enabled: true;
     callback clicked();
 
+    forward-focus: key-focus;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.button-enabled;
+    accessible-action-default => {
+        if (root.button-enabled) { root.clicked(); }
+    }
+
     height: 36px;
     min-width: label-text.preferred-width + 26px;
     border-radius: 10px;
     background: !root.button-enabled ? (root.primary ? Ui.accent-disabled : Ui.raised)
         : root.primary ? (touch.pressed || touch.has-hover ? Ui.accent-hover : Ui.accent)
         : (touch.pressed ? Ui.raised : touch.has-hover ? Ui.hover-surface : Ui.surface);
-    border-width: root.primary ? 0px : 1px;
-    border-color: Ui.hairline;
+    border-width: root.primary ? (key-focus.has-focus ? 2px : 0px) : 1px;
+    border-color: key-focus.has-focus ? (root.primary ? Ui.text : Ui.accent) : Ui.hairline;
 
     label-text := Text {
         width: 100%;
@@ -129,6 +268,7 @@ export component FlatButton inherits Rectangle {
         font-weight: root.primary ? 500 : 400;
         horizontal-alignment: center;
         vertical-alignment: center;
+        accessible-role: none;
     }
 
     touch := TouchArea {
@@ -136,8 +276,22 @@ export component FlatButton inherits Rectangle {
         mouse-cursor: root.button-enabled ? pointer : default;
         clicked => {
             if (root.button-enabled) {
+                key-focus.focus();
                 root.clicked();
             }
+        }
+    }
+
+    key-focus := FocusScope {
+        x: 0;
+        width: 0px;
+        enabled: root.button-enabled;
+        key-pressed(event) => {
+            if (event.text == Key.Space || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            return reject;
         }
     }
 }
@@ -145,14 +299,24 @@ export component FlatButton inherits Rectangle {
 export component SelectChip inherits Rectangle {
     in property <string> value;
     in property <length> chip-width: 118px;
+    in property <bool> chip-enabled: true;
     callback activated();
+
+    forward-focus: key-focus;
+    accessible-role: button;
+    accessible-label: root.value;
+    accessible-description: "Activate to change the selection.";
+    accessible-enabled: root.chip-enabled;
+    accessible-action-default => {
+        if (root.chip-enabled) { root.activated(); }
+    }
 
     height: 32px;
     width: chip-width;
     border-radius: 8px;
-    background: touch.has-hover ? Ui.hover-surface : Ui.surface;
+    background: !root.chip-enabled ? Ui.raised : touch.has-hover ? Ui.hover-surface : Ui.surface;
     border-width: 1px;
-    border-color: Ui.hairline;
+    border-color: key-focus.has-focus ? Ui.accent : Ui.hairline;
 
     HorizontalLayout {
         padding-left: 10px;
@@ -162,22 +326,41 @@ export component SelectChip inherits Rectangle {
         Text {
             text: root.value;
             font-size: 12px;
-            color: Ui.text;
+            color: root.chip-enabled ? Ui.text : Ui.muted;
             vertical-alignment: center;
             overflow: elide;
+            accessible-role: none;
         }
         Text {
             text: "\u{25BE}";
             font-size: 10px;
             color: Ui.muted;
             vertical-alignment: center;
+            accessible-role: none;
         }
     }
 
     touch := TouchArea {
-        mouse-cursor: pointer;
+        enabled: root.chip-enabled;
+        mouse-cursor: root.chip-enabled ? pointer : default;
         clicked => {
-            root.activated();
+            if (root.chip-enabled) {
+                key-focus.focus();
+                root.activated();
+            }
+        }
+    }
+
+    key-focus := FocusScope {
+        x: 0;
+        width: 0px;
+        enabled: root.chip-enabled;
+        key-pressed(event) => {
+            if (event.text == Key.Space || event.text == Key.Return) {
+                root.activated();
+                return accept;
+            }
+            return reject;
         }
     }
 }
@@ -186,8 +369,22 @@ export component CheckRow inherits Rectangle {
     in-out property <bool> checked: true;
     in property <string> label;
     in property <bool> row-enabled: true;
+
+    forward-focus: key-focus;
+    accessible-role: checkbox;
+    accessible-label: root.label;
+    accessible-enabled: root.row-enabled;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-action-default => {
+        if (root.row-enabled) { root.checked = !root.checked; }
+    }
+
     height: 24px;
     background: transparent;
+    border-width: key-focus.has-focus ? 1px : 0px;
+    border-color: key-focus.has-focus ? Ui.accent : transparent;
+    border-radius: 4px;
 
     HorizontalLayout {
         spacing: 8px;
@@ -210,6 +407,7 @@ export component CheckRow inherits Rectangle {
                 font-size: 10px;
                 horizontal-alignment: center;
                 vertical-alignment: center;
+                accessible-role: none;
             }
         }
         Text {
@@ -217,6 +415,7 @@ export component CheckRow inherits Rectangle {
             font-size: 12px;
             color: root.row-enabled ? Ui.text : Ui.muted;
             vertical-alignment: center;
+            accessible-role: none;
         }
     }
 
@@ -225,8 +424,22 @@ export component CheckRow inherits Rectangle {
         mouse-cursor: root.row-enabled ? pointer : default;
         clicked => {
             if (root.row-enabled) {
+                key-focus.focus();
                 root.checked = !root.checked;
             }
+        }
+    }
+
+    key-focus := FocusScope {
+        x: 0;
+        width: 0px;
+        enabled: root.row-enabled;
+        key-pressed(event) => {
+            if (event.text == Key.Space || event.text == Key.Return) {
+                root.checked = !root.checked;
+                return accept;
+            }
+            return reject;
         }
     }
 }
@@ -234,7 +447,18 @@ export component CheckRow inherits Rectangle {
 export component QuietTab inherits Rectangle {
     in property <string> label;
     in property <bool> selected: false;
+    in property <bool> tab-enabled: true;
     callback clicked();
+
+    forward-focus: key-focus;
+    accessible-role: tab;
+    accessible-label: root.label;
+    accessible-enabled: root.tab-enabled;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.selected;
+    accessible-action-default => {
+        if (root.tab-enabled) { root.clicked(); }
+    }
 
     height: 32px;
     width: tab-text.preferred-width + 4px;
@@ -246,8 +470,9 @@ export component QuietTab inherits Rectangle {
         text: root.label;
         font-size: 13px;
         font-weight: root.selected ? 500 : 400;
-        color: root.selected ? Ui.text : Ui.muted;
+        color: root.tab-enabled && root.selected ? Ui.text : Ui.muted;
         vertical-alignment: center;
+        accessible-role: none;
     }
 
     Rectangle {
@@ -259,9 +484,37 @@ export component QuietTab inherits Rectangle {
     }
 
     TouchArea {
-        mouse-cursor: pointer;
+        enabled: root.tab-enabled;
+        mouse-cursor: root.tab-enabled ? pointer : default;
         clicked => {
-            root.clicked();
+            if (root.tab-enabled) {
+                key-focus.focus();
+                root.clicked();
+            }
         }
+    }
+
+    key-focus := FocusScope {
+        x: 0;
+        width: 0px;
+        enabled: root.tab-enabled;
+        key-pressed(event) => {
+            if (event.text == Key.Space || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: parent.height - 2px;
+        background: transparent;
+        border-radius: 4px;
+        border-width: key-focus.has-focus ? 1px : 0px;
+        border-color: Ui.accent;
     }
 }

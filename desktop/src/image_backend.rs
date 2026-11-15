@@ -4,7 +4,13 @@ use crate::contracts::{ImageGenerationBackend, ImageRequest, ImageResult};
 use base64::Engine;
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
+use std::io::Read;
 use std::time::Duration;
+
+const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_IMAGE_RESPONSE_BYTES: usize = 96 * 1024 * 1024;
+const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+const MAX_BASE64_IMAGE_BYTES: usize = ((MAX_IMAGE_BYTES + 2) / 3) * 4;
 
 pub struct OpenAiImageBackend {
     base_url: String,
@@ -16,7 +22,9 @@ impl OpenAiImageBackend {
     pub fn new(base_url: impl Into<String>, api_key: Option<String>) -> Self {
         Self {
             base_url: base_url.into().trim().trim_end_matches('/').to_string(),
-            api_key: api_key.filter(|key| !key.trim().is_empty()),
+            api_key: api_key
+                .map(|key| key.trim().to_string())
+                .filter(|key| !key.is_empty()),
             client: Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .build()
@@ -25,6 +33,9 @@ impl OpenAiImageBackend {
     }
 
     fn endpoint(&self) -> String {
+        if self.base_url.ends_with("/images/generations") {
+            return self.base_url.clone();
+        }
         if self.base_url.ends_with("/v1") {
             format!("{}/images/generations", self.base_url)
         } else {
@@ -35,7 +46,9 @@ impl OpenAiImageBackend {
 
 impl ImageGenerationBackend for OpenAiImageBackend {
     fn available(&self) -> bool {
-        !self.base_url.is_empty()
+        reqwest::Url::parse(&self.endpoint())
+            .map(|url| matches!(url.scheme(), "http" | "https"))
+            .unwrap_or(false)
     }
 
     fn generate(&self, request: &ImageRequest) -> Result<ImageResult, String> {
@@ -61,13 +74,22 @@ impl ImageGenerationBackend for OpenAiImageBackend {
             .send()
             .map_err(|error| format!("Image generation failed: {error}"))?;
         let status = response.status();
-        let payload = response
-            .text()
-            .map_err(|error| format!("Image response could not be read: {error}"))?;
         if !status.is_success() {
-            return Err(format!("Image API HTTP {status}: {payload}"));
+            let (payload, truncated) = read_limited_body(response, MAX_ERROR_BODY_BYTES)?;
+            let suffix = if truncated { "... (truncated)" } else { "" };
+            return Err(format!(
+                "Image API HTTP {status}: {}{suffix}",
+                truncate_payload(&String::from_utf8_lossy(&payload))
+            ));
         }
-        let value: Value = serde_json::from_str(&payload)
+        let (payload, truncated) = read_limited_body(response, MAX_IMAGE_RESPONSE_BYTES)?;
+        if truncated {
+            return Err(format!(
+                "Image response exceeded the {} MiB size limit",
+                MAX_IMAGE_RESPONSE_BYTES / (1024 * 1024)
+            ));
+        }
+        let value: Value = serde_json::from_slice(&payload)
             .map_err(|error| format!("Image response is not JSON: {error}"))?;
         if let Some(encoded) = value
             .get("data")
@@ -77,12 +99,24 @@ impl ImageGenerationBackend for OpenAiImageBackend {
             .and_then(Value::as_str)
             .filter(|encoded| !encoded.is_empty())
         {
+            if encoded.len() > MAX_BASE64_IMAGE_BYTES {
+                return Err(format!(
+                    "Generated image exceeded the {} MiB size limit",
+                    MAX_IMAGE_BYTES / (1024 * 1024)
+                ));
+            }
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
                 .map_err(|error| format!("Image base64 was invalid: {error}"))?;
+            if bytes.len() > MAX_IMAGE_BYTES {
+                return Err(format!(
+                    "Generated image exceeded the {} MiB size limit",
+                    MAX_IMAGE_BYTES / (1024 * 1024)
+                ));
+            }
             return Ok(ImageResult {
+                media_type: detect_image_media_type(&bytes).unwrap_or("image/png").into(),
                 bytes,
-                media_type: "image/png".into(),
             });
         }
         if let Some(url) = value
@@ -101,21 +135,87 @@ impl ImageGenerationBackend for OpenAiImageBackend {
                 .map_err(|error| format!("Image download failed: {error}"))?;
             let status = response.status();
             if !status.is_success() {
-                return Err(format!("Image download HTTP {status}"));
+                let (payload, truncated) = read_limited_body(response, MAX_ERROR_BODY_BYTES)?;
+                let suffix = if truncated { "... (truncated)" } else { "" };
+                return Err(format!(
+                    "Image download HTTP {status}: {}{suffix}",
+                    truncate_payload(&String::from_utf8_lossy(&payload))
+                ));
             }
             let media_type = response
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or("image/png")
+                .split(';')
+                .next()
+                .unwrap_or("image/png")
+                .trim()
                 .to_string();
-            let bytes = response
-                .bytes()
-                .map_err(|error| format!("Image download could not be read: {error}"))?
-                .to_vec();
+            let (bytes, truncated) = read_limited_body(response, MAX_IMAGE_BYTES)?;
+            if truncated {
+                return Err(format!(
+                    "Downloaded image exceeded the {} MiB size limit",
+                    MAX_IMAGE_BYTES / (1024 * 1024)
+                ));
+            }
+            let media_type = detect_image_media_type(&bytes)
+                .unwrap_or(&media_type)
+                .to_string();
             return Ok(ImageResult { bytes, media_type });
         }
         Err("Image response contained neither b64_json nor url".into())
+    }
+}
+
+/// Read only a fixed prefix to keep provider responses and error pages bounded.
+fn read_limited_body(
+    response: reqwest::blocking::Response,
+    limit: usize,
+) -> Result<(Vec<u8>, bool), String> {
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    response
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Image response could not be read: {error}"))?;
+    let truncated = bytes.len() > limit;
+    bytes.truncate(limit);
+    Ok((bytes, truncated))
+}
+
+/// Error payloads can be large HTML pages; keep the message readable.
+fn truncate_payload(payload: &str) -> String {
+    const LIMIT: usize = 500;
+    let trimmed = payload.trim();
+    if trimmed.len() <= LIMIT {
+        return trimmed.to_string();
+    }
+    let mut end = LIMIT;
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... (truncated)", trimmed[..end].trim_end())
+}
+
+fn detect_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        Some("image/jpeg")
+    } else if bytes.len() >= 8
+        && bytes[0] == 0x89
+        && bytes[1] == b'P'
+        && bytes[2] == b'N'
+        && bytes[3] == b'G'
+    {
+        Some("image/png")
+    } else if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        Some("image/gif")
+    } else if bytes.len() >= 12
+        && bytes.starts_with(b"RIFF")
+        && bytes[8..].starts_with(b"WEBP")
+    {
+        Some("image/webp")
+    } else {
+        None
     }
 }
 

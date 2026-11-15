@@ -84,26 +84,43 @@ class DocumentStore(context: Context) : SQLiteOpenHelper(
         }
     }
 
-    fun readForSearch(): List<StoredChunk> {
-        val result = mutableListOf<StoredChunk>()
-        readableDatabase.query(
-            TABLE,
-            arrayOf("doc_id", "doc_name", "ordinal", "total", "text", "embedding"),
-            null, null, null, null, "id ASC"
-        ).use { cursor ->
-            while (cursor.moveToNext()) {
-                val embedding = decode(cursor.getBlob(5)) ?: continue
-                result += StoredChunk(
-                    docId = cursor.getString(0),
-                    docNameCipher = cursor.getString(1),
-                    ordinal = cursor.getInt(2),
-                    total = cursor.getInt(3),
-                    textCipher = cursor.getString(4),
-                    embedding = embedding
-                )
+    /** Streams only selected documents so search does not materialize the full library. */
+    fun forEachForSearch(documentIds: Set<String>, action: (StoredChunk) -> Unit) {
+        if (documentIds.isEmpty()) return
+
+        val columns = arrayOf("doc_id", "doc_name", "ordinal", "total", "text", "embedding")
+        val idIterator = documentIds.iterator()
+        while (idIterator.hasNext()) {
+            // Stay below SQLite's 999 bind-parameter limit on older Android versions.
+            val ids = ArrayList<String>(MAX_QUERY_DOCUMENT_IDS)
+            while (ids.size < MAX_QUERY_DOCUMENT_IDS && idIterator.hasNext()) {
+                ids += idIterator.next()
+            }
+            val selection = ids.joinToString(",", prefix = "doc_id IN (", postfix = ")") { "?" }
+            readableDatabase.query(
+                TABLE,
+                columns,
+                selection,
+                ids.toTypedArray(),
+                null,
+                null,
+                "id ASC"
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    val embedding = decode(cursor.getBlob(5)) ?: continue
+                    action(
+                        StoredChunk(
+                            docId = cursor.getString(0),
+                            docNameCipher = cursor.getString(1),
+                            ordinal = cursor.getInt(2),
+                            total = cursor.getInt(3),
+                            textCipher = cursor.getString(4),
+                            embedding = embedding
+                        )
+                    )
+                }
             }
         }
-        return result
     }
 
     /**
@@ -186,6 +203,7 @@ class DocumentStore(context: Context) : SQLiteOpenHelper(
         private const val DATABASE_NAME = "local_llm_documents.db"
         private const val DATABASE_VERSION = 1
         private const val TABLE = "doc_chunks"
+        private const val MAX_QUERY_DOCUMENT_IDS = 900
     }
 }
 

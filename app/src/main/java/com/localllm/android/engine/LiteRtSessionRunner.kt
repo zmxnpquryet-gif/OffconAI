@@ -241,14 +241,20 @@ internal class LiteRtSessionRunner(
                     val estimatedPromptTokens = maxOf(1, formattedPrompt.length / 3)
                     val promptSpeed = estimatedPromptTokens / promptEvalTimeSec
 
+                    // Length snapshots first: substring() copies only the newly
+                    // committed delta (O(delta)); full toString() per token is O(n^2).
+                    val prevContentLen = reasoningParser.contentBuffer.length
+                    val prevReasoningLen = reasoningParser.reasoningBuffer.length
                     reasoningParser.processChunk(rawChunk)
 
                     emit(
                         GenerationChunk(
                             token = rawChunk,
                             isReasoning = reasoningParser.isInReasoningMode,
-                            currentReasoningText = reasoningParser.reasoningBuffer.toString(),
-                            currentContentText = reasoningParser.contentBuffer.toString(),
+                            currentReasoningText = "",
+                            currentContentText = "",
+                            contentDelta = reasoningParser.contentBuffer.substring(prevContentLen),
+                            reasoningDelta = reasoningParser.reasoningBuffer.substring(prevReasoningLen),
                             tps = currentTps,
                             promptSpeed = promptSpeed,
                             totalTokens = totalTokens,

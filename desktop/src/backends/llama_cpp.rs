@@ -5,7 +5,8 @@ use crate::contracts::{
     StreamEvent,
 };
 use crate::process::{
-    default_threads, log_path, log_tail, resolve_executable, spawn_with_log, wait_for, ProcessSlot,
+    default_threads, log_path, log_tail, resolve_executable, sanitize_path, spawn_with_log,
+    wait_for_process_health, ProcessSlot, WaitOutcome,
 };
 use crate::transport::OpenAiTransport;
 use std::path::Path;
@@ -87,7 +88,8 @@ impl LlmBackend for LlamaCpp {
             .map(str::trim)
             .filter(|path| !path.is_empty())
             .unwrap_or(&self.config.default_model_path);
-        if !Path::new(model_path).is_file() {
+        let sanitized = sanitize_path(model_path);
+        if !Path::new(&sanitized).is_file() {
             return Err("llama.cpp requires an existing local GGUF model path".into());
         }
         let executable = resolve_executable(&self.config.executable).ok_or_else(|| {
@@ -99,7 +101,7 @@ impl LlmBackend for LlamaCpp {
         let mut command = Command::new(&executable);
         command
             .arg("--model")
-            .arg(model_path)
+            .arg(&sanitized)
             .arg("--host")
             .arg(&self.config.host)
             .arg("--port")
@@ -116,14 +118,22 @@ impl LlmBackend for LlamaCpp {
         let child = spawn_with_log(command, &log)?;
         self.slot.store_child(child, log.clone());
         self.slot.set_loaded(model.effective_served_id());
-        if !wait_for(Duration::from_secs(90), || {
-            self.slot.alive() && self.transport.health_available(&self.base_url())
+        match wait_for_process_health(Duration::from_secs(90), &self.slot, || {
+            self.transport.health_available(&self.base_url())
         }) {
-            let tail = log_tail(Some(&log), 20);
-            self.slot.clear();
-            return Err(format!("llama-server did not become healthy. {tail}"));
+            WaitOutcome::Success => Ok(()),
+            WaitOutcome::ProcessExited(code) => {
+                let tail = log_tail(Some(&log), 20);
+                self.slot.clear();
+                let code_str = code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
+                Err(format!("llama-server exited prematurely with code {code_str}. {tail}"))
+            }
+            WaitOutcome::TimedOut => {
+                let tail = log_tail(Some(&log), 20);
+                self.slot.clear();
+                Err(format!("llama-server did not become healthy within 90s. {tail}"))
+            }
         }
-        Ok(())
     }
 
     fn unload(&self) {
@@ -136,12 +146,31 @@ impl LlmBackend for LlamaCpp {
         cancel: &AtomicBool,
         listener: &mut dyn FnMut(StreamEvent),
     ) {
-        if !self.transport.health_available(&self.base_url()) {
-            listener(StreamEvent::Error(format!(
-                "llama-server is not loaded or reachable at {}",
-                self.base_url()
-            )));
+        // Managed subprocess: a live PID means the server was healthy at load time,
+        // so skip the extra /health round-trip on every message and let the chat
+        // request itself surface failures. External endpoints still get a check.
+        let has_managed_child = self.slot.has_child_process();
+        if self.slot.loaded().is_none() && !has_managed_child {
+            listener(StreamEvent::Error(
+                "llama-server backend is not loaded — press Load first.".into(),
+            ));
             return;
+        }
+        if has_managed_child && !self.slot.alive() {
+            listener(StreamEvent::Error(
+                "The managed llama-server process exited — press Load to restart it.".into(),
+            ));
+            return;
+        }
+        let managed = has_managed_child;
+        if !managed {
+            if !self.transport.health_available(&self.base_url()) {
+                listener(StreamEvent::Error(format!(
+                    "llama-server is not loaded or reachable at {}",
+                    self.base_url()
+                )));
+                return;
+            }
         }
         let effective = request.with_default_model(self.slot.loaded().as_deref());
         self.slot.active_requests.fetch_add(1, Ordering::Relaxed);

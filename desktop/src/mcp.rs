@@ -3,12 +3,20 @@
 //! `Mcp-Session-Id` session tracking, and host-safe bearer authentication.
 
 use crate::contracts::ToolDefinition;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
 use reqwest::Url;
 use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+const MAX_MCP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MCP_ERROR_BYTES: usize = 8 * 1024;
+const MAX_TOOL_LIST_PAGES: usize = 100;
+const MAX_TOOLS: usize = 4096;
+const MAX_TOOL_DEFINITIONS_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct McpConnectionInfo {
@@ -108,8 +116,18 @@ impl McpClient {
         })
         .to_string();
 
-        let (session_id, init_body) =
+        let (mut session_id, init_body) =
             self.post_rpc(clean_url, &init_payload, None, token.as_deref(), Some(init_id))?;
+        if let Some(message) = rpc_error_message(&init_body) {
+            return Err(format!("MCP initialize failed: {message}"));
+        }
+        if !init_body
+            .get("result")
+            .map(Value::is_object)
+            .unwrap_or(false)
+        {
+            return Err("MCP initialize response did not contain a result object.".into());
+        }
         let server_name = parse_server_name(&init_body)
             .unwrap_or_else(|| parsed.host_str().unwrap_or("MCP").to_string());
 
@@ -119,39 +137,86 @@ impl McpClient {
             "params": {}
         })
         .to_string();
-        let _ = self.post_rpc(
+        if let Ok((next_session_id, _)) = self.post_rpc(
             clean_url,
             &initialized_notif,
             session_id.as_deref(),
             token.as_deref(),
             None,
-        );
-
-        let list_id = self.next_id();
-        let list_payload = json!({
-            "jsonrpc": "2.0",
-            "id": list_id,
-            "method": "tools/list",
-            "params": {}
-        })
-        .to_string();
-        let (_, list_body) = self.post_rpc(
-            clean_url,
-            &list_payload,
-            session_id.as_deref(),
-            token.as_deref(),
-            Some(list_id),
-        )?;
-
-        if let Some(err) = list_body.get("error").filter(|v| !v.is_null()) {
-            let msg = err
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("MCP tools/list returned an error");
-            return Err(msg.to_string());
+        ) {
+            if next_session_id.is_some() {
+                session_id = next_session_id;
+            }
         }
 
-        let tools = parse_tools(&list_body);
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut seen_tool_names = HashSet::new();
+        let mut tool_definition_bytes = 0usize;
+        for page in 0..MAX_TOOL_LIST_PAGES {
+            let mut params = json!({});
+            if let Some(cursor_value) = cursor.as_ref() {
+                params["cursor"] = Value::String(cursor_value.clone());
+            }
+            let list_id = self.next_id();
+            let list_payload = json!({
+                "jsonrpc": "2.0",
+                "id": list_id,
+                "method": "tools/list",
+                "params": params
+            })
+            .to_string();
+            let (next_session_id, list_body) = self.post_rpc(
+                clean_url,
+                &list_payload,
+                session_id.as_deref(),
+                token.as_deref(),
+                Some(list_id),
+            )?;
+            if next_session_id.is_some() {
+                session_id = next_session_id;
+            }
+            if let Some(message) = rpc_error_message(&list_body) {
+                return Err(message);
+            }
+
+            let result = list_body
+                .get("result")
+                .ok_or_else(|| "MCP tools/list response did not contain a result.".to_string())?;
+            let page_tools = parse_tools(result)?;
+            if tools.len().saturating_add(page_tools.len()) > MAX_TOOLS {
+                return Err("MCP server returned more tools than the supported limit.".into());
+            }
+            for tool in &page_tools {
+                if !seen_tool_names.insert(tool.name.clone()) {
+                    return Err(format!("MCP server returned duplicate tool name: {}", tool.name));
+                }
+            }
+            let page_bytes = serde_json::to_vec(&page_tools)
+                .map_err(|error| format!("MCP tool definitions could not be sized: {error}"))?
+                .len();
+            tool_definition_bytes = tool_definition_bytes.saturating_add(page_bytes);
+            if tool_definition_bytes > MAX_TOOL_DEFINITIONS_BYTES {
+                return Err("MCP tool definitions exceeded the 16 MiB aggregate size limit.".into());
+            }
+            tools.extend(page_tools);
+
+            cursor = match result.get("nextCursor") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(next)) => Some(next.clone()),
+                Some(_) => return Err("MCP tools/list returned an invalid pagination cursor.".into()),
+            };
+            let Some(next) = cursor.as_ref() else {
+                break;
+            };
+            if !seen_cursors.insert(next.clone()) {
+                return Err("MCP tools/list repeated a pagination cursor.".into());
+            }
+            if page + 1 == MAX_TOOL_LIST_PAGES {
+                return Err("MCP tools/list exceeded the page limit.".into());
+            }
+        }
         let latency_ms = started.elapsed().as_millis();
 
         let mut guard = self.state.lock().expect("mcp state lock");
@@ -180,18 +245,26 @@ impl McpClient {
             (ep, guard.session_id.clone(), guard.bearer_token.clone())
         };
 
-        let raw_args = if arguments_json.trim().is_empty() {
-            "{}"
+        let raw_args = arguments_json.trim();
+        let args_val: Value = if raw_args.is_empty() || raw_args == "{}" {
+            json!({})
         } else {
-            arguments_json.trim()
-        };
-        let args_val: Value = match serde_json::from_str(raw_args) {
-            Ok(Value::Object(map)) => Value::Object(map),
-            _ => {
-                return McpCallOutcome {
-                    is_success: false,
-                    output: "Tool arguments are not a valid JSON object.".into(),
-                };
+            match serde_json::from_str(raw_args) {
+                Ok(Value::Object(map)) => Value::Object(map),
+                Ok(Value::String(s)) => {
+                    // Handle double-encoded JSON string: e.g. "\"{\\\"city\\\": \\\"Seoul\\\"}\""
+                    match serde_json::from_str::<Value>(&s) {
+                        Ok(Value::Object(map)) => Value::Object(map),
+                        _ => json!({ "input": s }),
+                    }
+                }
+                Ok(val) => json!({ "input": val }),
+                Err(_) => {
+                    return McpCallOutcome {
+                        is_success: false,
+                        output: format!("Tool arguments are not valid JSON: {raw_args}"),
+                    };
+                }
             }
         };
 
@@ -223,36 +296,38 @@ impl McpClient {
             }
         };
 
-        if let Some(err) = body.get("error").filter(|v| !v.is_null()) {
-            let msg = err
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("Unknown MCP error");
+        if let Some(message) = rpc_error_message(&body) {
             return McpCallOutcome {
                 is_success: false,
-                output: format!("MCP tool error: {msg}"),
+                output: format!("MCP tool error: {message}"),
             };
         }
 
-        let result = body.get("result");
+        let Some(result) = body.get("result").filter(|value| value.is_object()) else {
+            return McpCallOutcome {
+                is_success: false,
+                output: "MCP tool response did not contain a result object.".into(),
+            };
+        };
         let failed = result
-            .and_then(|r| r.get("isError"))
+            .get("isError")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let Some(items) = result.get("content").and_then(Value::as_array) else {
+            return McpCallOutcome {
+                is_success: false,
+                output: "MCP tool response did not contain a content array.".into(),
+            };
+        };
         let mut texts = Vec::new();
-        if let Some(items) = result
-            .and_then(|r| r.get("content"))
-            .and_then(Value::as_array)
-        {
-            for item in items {
-                let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
-                if kind == "text" {
-                    if let Some(t) = item.get("text").and_then(Value::as_str) {
-                        texts.push(t.to_string());
-                    }
-                } else if !kind.is_empty() {
-                    texts.push(format!("[{kind} content omitted: only text is supported]"));
+        for item in items {
+            let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+            if kind == "text" {
+                if let Some(t) = item.get("text").and_then(Value::as_str) {
+                    texts.push(t.to_string());
                 }
+            } else if !kind.is_empty() {
+                texts.push(format!("[{kind} content omitted: only text is supported]"));
             }
         }
 
@@ -296,15 +371,33 @@ impl McpClient {
             .get("Mcp-Session-Id")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let raw = resp.text().unwrap_or_default();
         if !status.is_success() {
-            return Err(format!("HTTP {status}: {raw}"));
+            let (raw, truncated) = read_limited_response(resp, MAX_MCP_ERROR_BYTES)?;
+            let suffix = if truncated { "... (truncated)" } else { "" };
+            return Err(format!("HTTP {status}: {raw}{suffix}"));
+        }
+        let (raw, truncated) = read_limited_response(resp, MAX_MCP_RESPONSE_BYTES)?;
+        if truncated {
+            return Err(format!(
+                "MCP response exceeded the {} MiB size limit.",
+                MAX_MCP_RESPONSE_BYTES / (1024 * 1024)
+            ));
         }
         if expected_id.is_none() {
+            if let Some(sid) = new_sid.as_deref() {
+                if let Ok(mut guard) = self.state.lock() {
+                    guard.session_id = Some(sid.to_string());
+                }
+            }
             return Ok((new_sid, Value::Null));
         }
         let body = extract_json_rpc_message(&raw, expected_id)
             .ok_or_else(|| "MCP response was not valid JSON-RPC.".to_string())?;
+        if let Some(sid) = new_sid.as_deref() {
+            if let Ok(mut guard) = self.state.lock() {
+                guard.session_id = Some(sid.to_string());
+            }
+        }
         Ok((new_sid, body))
     }
 }
@@ -323,30 +416,46 @@ fn parse_server_name(envelope: &Value) -> Option<String> {
     }
 }
 
-fn parse_tools(envelope: &Value) -> Vec<ToolDefinition> {
-    let Some(arr) = envelope
-        .get("result")
-        .and_then(|r| r.get("tools"))
+fn rpc_error_message(envelope: &Value) -> Option<String> {
+    let error = envelope.get("error").filter(|value| !value.is_null())?;
+    Some(
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown MCP error")
+            .to_string(),
+    )
+}
+
+fn parse_tools(result: &Value) -> Result<Vec<ToolDefinition>, String> {
+    let arr = result
+        .get("tools")
         .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
+        .ok_or_else(|| "MCP tools/list result did not contain a tools array.".to_string())?;
     arr.iter()
-        .filter_map(|item| {
-            let name = item.get("name")?.as_str()?.trim();
-            if name.is_empty() {
-                return None;
-            }
+        .enumerate()
+        .map(|(index, item)| {
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| format!("MCP tool at index {index} has no valid name."))?;
             let description = item
                 .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+                .map(|value| {
+                    value.as_str().map(str::to_string).ok_or_else(|| {
+                        format!("MCP tool {name} has an invalid description.")
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default();
             let parameters = item
                 .get("inputSchema")
                 .cloned()
-                .unwrap_or_else(|| json!({"type": "object"}));
-            Some(ToolDefinition {
+                .filter(Value::is_object)
+                .ok_or_else(|| format!("MCP tool {name} has no valid inputSchema object."))?;
+            Ok(ToolDefinition {
                 name: name.to_string(),
                 description,
                 parameters,
@@ -362,35 +471,77 @@ pub(crate) fn extract_json_rpc_message(raw: &str, expected_id: Option<u64>) -> O
     }
     if trimmed.starts_with('{') {
         let obj: Value = serde_json::from_str(trimmed).ok()?;
-        return matches_id(&obj, expected_id).then_some(obj);
+        return is_json_rpc_response(&obj, expected_id).then_some(obj);
     }
-    for line in trimmed.lines() {
-        let t = line.trim();
-        let Some(payload) = t.strip_prefix("data:") else {
+    let mut event_data = String::new();
+    let mut has_data = false;
+    for line in trimmed.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if has_data {
+                if let Ok(obj) = serde_json::from_str::<Value>(&event_data) {
+                    if is_json_rpc_response(&obj, expected_id) {
+                        return Some(obj);
+                    }
+                }
+                event_data.clear();
+                has_data = false;
+            }
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        let Some(data) = line.strip_prefix("data:") else {
             continue;
         };
-        let payload = payload.trim();
-        if payload.is_empty() || payload == "[DONE]" {
-            continue;
+        if has_data {
+            event_data.push('\n');
         }
-        if let Ok(obj) = serde_json::from_str::<Value>(payload) {
-            if matches_id(&obj, expected_id) && (obj.get("result").is_some() || obj.get("error").is_some()) {
-                return Some(obj);
-            }
-        }
+        event_data.push_str(data.strip_prefix(' ').unwrap_or(data));
+        has_data = true;
     }
     None
+}
+
+fn is_json_rpc_response(obj: &Value, expected_id: Option<u64>) -> bool {
+    let has_result = obj.get("result").is_some();
+    let has_error = obj.get("error").is_some();
+    obj.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && matches_id(obj, expected_id)
+        && (has_result ^ has_error)
+        && (!has_error
+            || obj
+                .get("error")
+                .and_then(Value::as_object)
+                .map(|error| {
+                    error.get("code").and_then(Value::as_i64).is_some()
+                        && error.get("message").and_then(Value::as_str).is_some()
+                })
+                .unwrap_or(false))
 }
 
 fn matches_id(obj: &Value, expected_id: Option<u64>) -> bool {
     let Some(expected) = expected_id else {
         return true;
     };
-    match obj.get("id") {
-        Some(Value::Number(n)) => n.as_u64() == Some(expected),
-        Some(Value::String(s)) => s == &expected.to_string(),
-        _ => false,
-    }
+    obj.get("id")
+        .and_then(Value::as_u64)
+        .map(|actual| actual == expected)
+        .unwrap_or(false)
+}
+
+fn read_limited_response(
+    response: Response,
+    limit: usize,
+) -> Result<(String, bool), String> {
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    response
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("MCP response could not be read: {error}"))?;
+    let truncated = bytes.len() > limit;
+    bytes.truncate(limit);
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
 }
 
 pub(crate) fn is_token_safe_url(url: &Url) -> bool {

@@ -252,4 +252,39 @@ class PromptFormatterTest {
         assertTrue(prompt.contains("tool block"))
         assertTrue(prompt.indexOf("report.xlsx") < prompt.indexOf("<|im_start|>user"))
     }
+
+    @Test
+    fun `normalizedHistory caps at six turns opening with the user`() {
+        val history = (0..9).flatMap { listOf("user" to "q$it", "assistant" to "a$it") }
+        val norm = PromptFormatter.normalizedHistory(history)
+        assertEquals(6, norm.size)
+        assertEquals("user" to "q7", norm.first())
+        assertEquals("assistant" to "a9", norm.last())
+    }
+
+    @Test
+    fun `normalizedHistory drops a leading assistant left by the cut`() {
+        val norm = PromptFormatter.normalizedHistory(
+            listOf("assistant" to "stale", "user" to "hi")
+        )
+        assertEquals(listOf("user" to "hi"), norm)
+    }
+
+    @Test
+    fun `normalizedHistory keeps at least one turn`() {
+        assertEquals(
+            listOf("assistant" to "only"),
+            PromptFormatter.normalizedHistory(listOf("assistant" to "only"))
+        )
+    }
+
+    @Test
+    fun `normalizedHistory folds roles to user and assistant`() {
+        val norm = PromptFormatter.normalizedHistory(
+            listOf("USER" to "hi", "TOOL" to "42", "System" to "note")
+        )
+        assertEquals("user", norm[0].first)
+        assertEquals("assistant", norm[1].first)
+        assertEquals("assistant", norm[2].first)
+    }
 }

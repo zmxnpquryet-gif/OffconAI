@@ -147,6 +147,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             activeModelId = { modelController.activeModel.value?.id ?: "" },
             languagePreference = { _settings.value.languagePreference },
             onStopGeneration = { stopGeneration() },
+            onCancelAndJoinTurn = ::cancelGenerationAndJoin,
             postStatus = { _engineStatusMessage.value = it }
         )
 
@@ -276,6 +277,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun selectConversation(conversationId: String) = conversationController.selectConversation(conversationId)
     fun deleteConversation(id: String) = conversationController.deleteConversation(id)
     fun clearAllHistory() = conversationController.clearAllHistory()
+    fun exportCurrentConversation(
+        uri: Uri,
+        format: String,
+        streamingMessage: ChatMessage?,
+        onComplete: (Result<Unit>) -> Unit
+    ) = conversationController.exportToUri(uri, format, streamingMessage, onComplete)
     fun renameConversation(id: String, newTitle: String) = conversationController.renameConversation(id, newTitle)
     fun setPendingAttachment(attachment: ChatAttachment?) = conversationController.setPendingAttachment(attachment)
     fun importDocument(uri: Uri, displayName: String) = conversationController.importDocument(uri, displayName)
@@ -387,7 +394,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun connectMcp(url: String, bearerToken: String? = null) = mcpController.connectMcp(url, bearerToken)
     fun clearMcpToken() = mcpController.clearToken()
     fun resolveToolApproval(approved: Boolean) = mcpController.resolveApproval(approved)
-    fun sendMessage(userPrompt: String) = chatRunner.sendMessage(userPrompt)
+    fun sendMessage(userPrompt: String): Boolean = chatRunner.sendMessage(userPrompt)
 
     fun stopGeneration() {
         mcpController.cancelPendingApproval()
@@ -398,6 +405,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         } catch (t: Throwable) {
             Log.w("MainViewModel", "Engine stop error", t)
         }
+    }
+
+    private suspend fun cancelGenerationAndJoin() {
+        mcpController.cancelPendingApproval()
+        try {
+            llmEngine.stopGeneration()
+        } catch (t: Throwable) {
+            Log.w("MainViewModel", "Engine stop error", t)
+        }
+        voiceController.stopAllVoiceActivityAndJoin()
+        chatRunner.cancelActiveTurnAndJoin()
     }
 
     // ---- Voice & Omni actions ----

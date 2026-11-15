@@ -12,6 +12,7 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
+import com.localllm.android.model.ToolCallTemplate
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -471,5 +472,43 @@ class McpToolProtocolTest {
         withTimeout(5000) { job.cancelAndJoin() }
         assertTrue(job.isCancelled)
         Unit
+    }
+
+    // ---------------- standalone JSON fallback ----------------
+
+    @Test
+    fun `standalone valid call to a known tool is accepted`() {
+        val batch = McpToolProtocol.parseBatch(
+            text = """{"name": "get_weather", "arguments": {"city": "Seoul"}}""",
+            available = tools,
+            template = ToolCallTemplate.HERMES
+        )
+        assertEquals(1, batch.calls.size)
+        assertTrue(batch.errors.isEmpty())
+        assertEquals("get_weather", batch.calls.single().name)
+    }
+
+    @Test
+    fun `standalone mistyped tool name feeds back an error instead of prose`() {
+        val batch = McpToolProtocol.parseBatch(
+            text = """{"name": "get_weathr", "arguments": {}}""",
+            available = tools,
+            template = ToolCallTemplate.HERMES
+        )
+        assertTrue(batch.calls.isEmpty())
+        assertEquals(1, batch.errors.size)
+    }
+
+    @Test
+    fun `plain json without a tool shape stays prose`() {
+        val text = """{"name": "Ada"}"""
+        val batch = McpToolProtocol.parseBatch(
+            text = text,
+            available = tools,
+            template = ToolCallTemplate.HERMES
+        )
+        assertTrue(batch.calls.isEmpty())
+        assertTrue(batch.errors.isEmpty())
+        assertEquals(text, batch.prose)
     }
 }
