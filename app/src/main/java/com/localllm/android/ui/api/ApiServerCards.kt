@@ -29,6 +29,7 @@ import androidx.compose.ui.unit.sp
 import com.localllm.android.R
 import com.localllm.android.ui.glass.GCard
 import com.localllm.android.ui.glass.GIcon
+import com.localllm.android.ui.glass.GCompactIconButton
 import com.localllm.android.ui.glass.GIconButton
 import com.localllm.android.ui.glass.GIcons
 import com.localllm.android.ui.glass.GText
@@ -83,7 +84,7 @@ internal fun AddressRow(
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (onToggleReveal != null) {
-                    GIconButton(onClick = onToggleReveal, modifier = Modifier.size(28.dp)) {
+                    GCompactIconButton(onClick = onToggleReveal) {
                         GIcon(
                             imageVector = if (revealed) GIcons.VisibilityOff else GIcons.Visibility,
                             contentDescription = if (revealed) stringResource(R.string.api_hide_key_desc)

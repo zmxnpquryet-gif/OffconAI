@@ -531,6 +531,9 @@ class ModelDownloader(client: OkHttpClient? = null) {
         val downloaded = transferWorker.fetch(
             taskTitle = taskTitle,
             finalUrl = probe.finalUrl,
+            // The declared URL, not the resolved one: object-storage redirect targets are
+            // signed per request, so only this is stable enough to identify a resume.
+            sourceKey = url,
             totalSize = probe.totalBytes,
             supportsRange = probe.supportsRange,
             targetFile = targetFile,

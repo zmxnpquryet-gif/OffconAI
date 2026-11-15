@@ -20,7 +20,12 @@ data class ToolExecution(
     val call: McpToolCall,
     val approved: Boolean,
     val result: McpToolCallResult? = null,
-    val declined: Boolean = false
+    val declined: Boolean = false,
+    /**
+     * True when a previous call of the same batch was declined, so this one never ran.
+     * It still needs an outcome: the assistant turn already announced the call.
+     */
+    val skipped: Boolean = false
 )
 
 fun interface ToolApprovalPolicy {

@@ -656,4 +656,45 @@
     <string name="chat_empty_suggest_api">로컬 API 연결 방법 알려줘</string>
     <string name="chat_empty_footer">계정 없음 · 텔레메트리 없음 · 오프라인 추론</string>
     <string name="chat_input_hint">메시지</string>
+
+    <!-- Composer: attachments, status strip, touch/semantics copy -->
+    <string name="chat_attachment_image">이미지</string>
+    <string name="chat_attachment_file">파일</string>
+    <string name="chat_attachment_remove">첨부 삭제</string>
+    <string name="chat_status_prefill">프롬프트 처리 중 · %1$s tok/s</string>
+    <string name="chat_status_generating">생성 중…</string>
+    <string name="chat_status_metrics">%1$s tok/s · %2$d ctx</string>
+    <string name="chat_status_loading_progress">%1$s · %2$d%%</string>
+    <string name="chat_status_preparing_image">이미지 입력 준비 중…</string>
+    <string name="chat_state_ready_to_send">보낼 준비됨</string>
+    <string name="chat_state_streaming">응답 생성 중 · 중지하려면 탭</string>
+    <string name="chat_send_disabled_hint">메시지를 입력하거나 파일을 첨부하면 보낼 수 있습니다</string>
+    <string name="chat_reasoning_effort_with_value">%1$s (%2$s)</string>
+    <string name="chat_reasoning_effort_expand">추론 깊이 조정</string>
+    <string name="chat_state_expanded">펼쳐짐</string>
+    <string name="chat_state_collapsed">접힘</string>
+    <string name="chat_attach_opening">선택기를 여는 중…</string>
+    <string name="chat_library_empty">라이브러리에 문서가 없습니다. PDF, XLSX, PPTX 또는 텍스트 파일을 첨부하면 이 대화에서 검색할 수 있습니다.</string>
+
+    <!-- Voice screen: native-audio facts, explicit states, microphone semantics -->
+    <string name="voice_native_session_title">네이티브 오디오 세션</string>
+    <string name="voice_native_session_desc">마이크 오디오(16 kHz PCM)가 모델로 직접 전달되고, 답변 텍스트와 음성이 함께 도착합니다.</string>
+    <string name="voice_native_model_fallback">네이티브 오디오 모델</string>
+    <string name="voice_mode_header_native">%1$s · 네이티브 오디오 입력 → 음성 출력 · 턴마다 한 번 탭</string>
+    <string name="voice_state_error">오류로 음성 대화가 중단되었습니다</string>
+    <string name="voice_status_label_idle">대기</string>
+    <string name="voice_status_label_listening">듣는 중</string>
+    <string name="voice_status_label_thinking">생각 중</string>
+    <string name="voice_status_label_speaking">말하는 중</string>
+    <string name="voice_status_label_error">오류</string>
+    <string name="voice_error_dismiss">닫기</string>
+    <string name="voice_mic_mute">마이크 음소거</string>
+    <string name="voice_mic_unmute">마이크 음소거 해제</string>
+    <string name="voice_tts_speaker_item">화자 %1$d</string>
+
+    <!-- Settings / drawer usability copy -->
+    <string name="settings_api_server_off_hint">서버가 중지되었습니다. 스위치를 켜면 요청을 처리합니다.</string>
+    <string name="settings_theme_swatch_desc">%1$s 테마</string>
+    <string name="drawer_recent_chats">최근 대화</string>
+    <string name="drawer_tools">도구</string>
 </resources>

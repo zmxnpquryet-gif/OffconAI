@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
@@ -25,6 +26,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 
 /** Primary glass button. */
@@ -118,6 +120,33 @@ fun GIconButton(
             .size(48.dp)
             .clip(CircleShape)
             .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center,
+        content = { content() }
+    )
+}
+
+/**
+ * Compact secondary icon action: the glyph keeps its small visual size while the touch
+ * area stays 48dp.
+ *
+ * Passing `Modifier.size(28.dp)` to [GIconButton] does not work — the caller's fixed
+ * constraint wins and the tap target shrinks with the glyph. Delete/dismiss actions were
+ * therefore 24–32dp in several screens; this composable keeps the same pixels on screen
+ * and restores the accessibility minimum.
+ */
+@Composable
+fun GCompactIconButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    content: @Composable () -> Unit
+) {
+    Box(
+        modifier = modifier
+            .alpha(if (enabled) 1f else 0.4f)
+            .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+            .clip(CircleShape)
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick),
         contentAlignment = Alignment.Center,
         content = { content() }
     )

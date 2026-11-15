@@ -12,6 +12,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
@@ -21,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -28,7 +30,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
@@ -182,12 +186,20 @@ fun GMenuItem(
  */
 val LocalHostNavBarInsets = staticCompositionLocalOf { WindowInsets(0, 0, 0, 0) }
 
-/** Bottom sheet replacing M3 ModalBottomSheet. */
+/**
+ * Bottom sheet replacing M3 ModalBottomSheet.
+ *
+ * The content column is height-capped to [maxHeightFraction] of the window and scrolls
+ * when it overflows, so a long list (e.g. the indexed-document library) can never push
+ * its rows off the top of the sheet or grow past the screen. Navigation-bar insets are
+ * applied to the sheet itself, which keeps the last row above the gesture bar.
+ */
 @Composable
 fun GSheet(
     visible: Boolean,
     onDismissRequest: () -> Unit,
     modifier: Modifier = Modifier,
+    maxHeightFraction: Float = 0.85f,
     content: @Composable ColumnScope.() -> Unit
 ) {
     if (!visible) return
@@ -196,7 +208,8 @@ fun GSheet(
         onDismissRequest = onDismissRequest,
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
     ) {
-        Box(modifier = Modifier.fillMaxSize()) {
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            val maxSheetContentHeight = maxHeight * maxHeightFraction
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -226,7 +239,10 @@ fun GSheet(
                         )
                 ) {
                     Column(
-                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                        modifier = Modifier
+                            .heightIn(max = maxSheetContentHeight)
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 24.dp, vertical = 20.dp),
                         content = content
                     )
                 }

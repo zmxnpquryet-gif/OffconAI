@@ -42,6 +42,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.localllm.android.R
 import com.localllm.android.ui.glass.GIcon
+import com.localllm.android.ui.glass.GCompactIconButton
 import com.localllm.android.ui.glass.GIconButton
 import com.localllm.android.ui.glass.GIcons
 import com.localllm.android.ui.glass.GText
@@ -128,13 +129,12 @@ fun ArtifactCard(artifact: MarkdownArtifact, modifier: Modifier = Modifier) {
                     color = GlassTheme.colors.onSurfaceVariant
                 )
             }
-            GIconButton(
+            GCompactIconButton(
                 onClick = {
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     clipboard.setPrimaryClip(ClipData.newPlainText("Artifact", artifact.code))
                     Toast.makeText(context, copiedText, Toast.LENGTH_SHORT).show()
-                },
-                modifier = Modifier.size(36.dp)
+                }
             ) {
                 GIcon(
                     imageVector = GIcons.ContentCopy,
@@ -143,9 +143,8 @@ fun ArtifactCard(artifact: MarkdownArtifact, modifier: Modifier = Modifier) {
                     modifier = Modifier.size(15.dp)
                 )
             }
-            GIconButton(
-                onClick = { expanded = !expanded },
-                modifier = Modifier.size(36.dp)
+            GCompactIconButton(
+                onClick = { expanded = !expanded }
             ) {
                 GIcon(
                     imageVector = if (expanded) GIcons.ArrowUp else GIcons.ArrowDown,

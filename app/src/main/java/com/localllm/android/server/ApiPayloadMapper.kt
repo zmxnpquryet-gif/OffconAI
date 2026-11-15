@@ -66,7 +66,11 @@ internal object ApiPayloadMapper {
             val msgObj = messagesArray.optJSONObject(i) ?: continue
             val rawRole = msgObj.optString("role", "user")
             val content = extractMessageContent(msgObj, rawRole)
-            val normalizedRole = if (rawRole == "tool") "user" else rawRole
+            // History pairs only carry user/assistant: tool outputs and out-of-band
+            // system/developer instructions are folded into user turns so a later
+            // takeLast cut can never surface them as a leading assistant message
+            // (some templates refuse prompts that open with the assistant).
+            val normalizedRole = if (rawRole == "assistant") "assistant" else "user"
             if (i == messagesArray.length() - 1 && normalizedRole == "user") {
                 lastUserPrompt = content
             } else {
@@ -113,6 +117,19 @@ internal object ApiPayloadMapper {
             }
         }
         return text
+    }
+
+    /**
+     * Incremental SSE delta for tool-aware streaming: the visible text is the
+     * full text minus reasoning/tool markup, so byte offsets into the raw text
+     * do not line up with visible offsets. Deltas are diffed against the
+     * previously emitted *visible* text; anything else either duplicates or
+     * swallows tokens. Returns null when there is nothing new to send.
+     */
+    fun visibleStreamDelta(fullVisible: String, emittedVisible: String): String? {
+        if (fullVisible.length <= emittedVisible.length) return null
+        if (!fullVisible.startsWith(emittedVisible)) return null
+        return fullVisible.substring(emittedVisible.length).ifEmpty { null }
     }
 
     fun parseOpenAiTools(json: JSONObject): List<McpTool> {
