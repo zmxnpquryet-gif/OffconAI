@@ -19,7 +19,7 @@ Or through the root Gradle wrapper tasks:
 .\gradlew.bat :desktop:test :desktop:installDist
 ```
 
-The release executable is produced at `desktop/target/release/offcon-desktop` (`.exe` on Windows) and staged into `desktop/build/install/desktop/bin/` by `:desktop:installDist`.
+The release executable is produced at `desktop/target/release/offcon-desktop` (`.exe` on Windows) and staged into `desktop/build/install/desktop/bin/` alongside the bundled `llama-server` inference engine compiled from `app/src/main/cpp/llama.cpp` by `:desktop:installDist`.
 
 ## Architecture
 

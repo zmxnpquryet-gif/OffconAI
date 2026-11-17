@@ -130,12 +130,49 @@ fn stop_child(child: Option<Child>) {
     if matches!(child.try_wait(), Ok(Some(_))) {
         return;
     }
+    let pid = child.id();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
 
+pub fn sanitize_path(input: &str) -> String {
+    let trimmed = input.trim();
+    if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        if trimmed.len() >= 2 {
+            return trimmed[1..trimmed.len() - 1].trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 pub fn log_path(name: &str) -> PathBuf {
-    PathBuf::from("build").join("desktop").join(name)
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("LOCALAPPDATA")
+        .filter(|v| !v.is_empty())
+        .map(|v| PathBuf::from(v).join("OffconAI").join("desktop").join("logs"))
+        .unwrap_or_else(|| std::env::temp_dir().join("offcon-desktop"));
+    #[cfg(not(target_os = "windows"))]
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(|v| PathBuf::from(v).join("offconai-desktop"))
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|v| PathBuf::from(v).join(".local").join("state").join("offconai-desktop"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("offcon-desktop"));
+    base.join(name)
 }
 
 fn open_log(path: &Path) -> Result<File, String> {
@@ -156,6 +193,12 @@ pub fn spawn_with_log(mut command: Command, path: &Path) -> Result<Child, String
         .try_clone()
         .map_err(|error| format!("could not clone the log handle: {error}"))?;
     command.stdout(Stdio::from(log)).stderr(Stdio::from(log_err));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
     command
         .spawn()
         .map_err(|error| format!("could not launch process (log {}): {error}", path.display()))
@@ -193,17 +236,30 @@ pub fn default_threads() -> usize {
         .unwrap_or(1)
 }
 
-pub fn resolve_executable(executable: &str) -> Option<PathBuf> {
-    let executable = executable.trim();
-    if executable.is_empty() {
-        return None;
+fn find_executable_in_dir(directory: &Path, executable: &str, extensions: &[String]) -> Option<PathBuf> {
+    let candidate = directory.join(executable);
+    if candidate.is_file() {
+        return Some(candidate);
     }
-    let direct = PathBuf::from(executable);
-    if direct.is_file() {
-        return Some(direct);
+    let has_extension = Path::new(executable)
+        .extension()
+        .is_some_and(|extension| !extension.is_empty());
+    if !has_extension {
+        for extension in extensions {
+            if extension.is_empty() {
+                continue;
+            }
+            let candidate = directory.join(format!("{executable}{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
     }
-    let path = std::env::var_os("PATH")?;
-    let extensions: Vec<String> = if cfg!(windows) {
+    None
+}
+
+fn platform_exe_extensions() -> Vec<String> {
+    if cfg!(windows) {
         std::env::var("PATHEXT")
             .unwrap_or_else(|_| ".EXE;.BAT;.CMD".into())
             .split(';')
@@ -211,25 +267,58 @@ pub fn resolve_executable(executable: &str) -> Option<PathBuf> {
             .collect()
     } else {
         vec![String::new()]
-    };
-    for directory in std::env::split_paths(&path) {
-        let candidate = directory.join(executable);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        let has_extension = Path::new(executable)
-            .extension()
-            .is_some_and(|extension| !extension.is_empty());
-        if !has_extension {
-            for extension in &extensions {
-                if extension.is_empty() {
-                    continue;
-                }
-                let candidate = directory.join(format!("{executable}{extension}"));
+    }
+}
+
+pub fn resolve_executable(executable: &str) -> Option<PathBuf> {
+    let clean = sanitize_path(executable);
+    let executable = clean.trim();
+    if executable.is_empty() {
+        return None;
+    }
+    let extensions = platform_exe_extensions();
+    let direct = PathBuf::from(executable);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    if cfg!(windows) && direct.extension().is_none() {
+        for ext in &extensions {
+            if !ext.is_empty() {
+                let candidate = PathBuf::from(format!("{executable}{ext}"));
                 if candidate.is_file() {
                     return Some(candidate);
                 }
             }
+        }
+    }
+
+    // For bare command names (e.g. "llama-server"), prefer engines bundled alongside
+    // the desktop executable before falling back to system PATH.
+    if Path::new(executable).components().count() == 1 {
+        if let Ok(current_exe) = std::env::current_exe() {
+            if let Some(exe_dir) = current_exe.parent() {
+                let mut search_dirs = vec![
+                    exe_dir.to_path_buf(),
+                    exe_dir.join("bin"),
+                    exe_dir.join("engine"),
+                ];
+                if let Some(parent) = exe_dir.parent() {
+                    search_dirs.push(parent.to_path_buf());
+                    search_dirs.push(parent.join("bin"));
+                }
+                for dir in search_dirs {
+                    if let Some(found) = find_executable_in_dir(&dir, executable, &extensions) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+    }
+
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        if let Some(found) = find_executable_in_dir(&directory, executable, &extensions) {
+            return Some(found);
         }
     }
     None
@@ -397,5 +486,33 @@ mod tests {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(2 * 1024 * 1024), "2 MiB");
         assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn sanitize_path_and_bundled_exe_lookup_work() {
+        assert_eq!(sanitize_path("  \"C:\\models\\a.gguf\"  "), "C:\\models\\a.gguf");
+        assert_eq!(sanitize_path("'llama-server'"), "llama-server");
+
+        let dir = std::env::temp_dir().join(format!(
+            "offcon_proc_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let exe_name = if cfg!(windows) {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        };
+        let target = dir.join(exe_name);
+        fs::write(&target, b"stub").unwrap();
+        let extensions = platform_exe_extensions();
+        assert_eq!(
+            find_executable_in_dir(&dir, "llama-server", &extensions),
+            Some(target.clone())
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

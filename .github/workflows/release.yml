@@ -26,6 +26,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -41,11 +43,35 @@ jobs:
           cargo test
           cargo build --release
 
+      - name: Build Bundled llama-server Inference Engine
+        shell: pwsh
+        run: |
+          cmake -S app/src/main/cpp/llama.cpp -B desktop/build/llama-cpp `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            -DGGML_OPENMP=OFF `
+            -DLLAMA_OPENSSL=OFF `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_APP=OFF `
+            -DLLAMA_BUILD_UI=OFF `
+            -DLLAMA_USE_PREBUILT_UI=OFF `
+            -DGGML_NATIVE=OFF `
+            -DGGML_SSE42=ON `
+            -DGGML_AVX=ON `
+            -DGGML_AVX2=ON
+          cmake --build desktop/build/llama-cpp --config Release --target llama-server --parallel
+
       - name: Package Windows Desktop Archive
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist-win/OffconAI-desktop | Out-Null
           Copy-Item desktop/target/release/offcon-desktop.exe dist-win/OffconAI-desktop/
+          Copy-Item desktop/build/llama-cpp/bin/Release/llama-server.exe dist-win/OffconAI-desktop/
+          if (!(Test-Path dist-win/OffconAI-desktop/offcon-desktop.exe)) { throw "Missing offcon-desktop.exe" }
+          if (!(Test-Path dist-win/OffconAI-desktop/llama-server.exe)) { throw "Missing bundled llama-server.exe" }
           Compress-Archive -Path dist-win/OffconAI-desktop/* -DestinationPath OffconAI-desktop-windows-x86_64.zip -Force
           Get-FileHash OffconAI-desktop-windows-x86_64.zip -Algorithm SHA256 | Format-List
 
@@ -135,6 +161,8 @@ jobs:
       - name: Build Linux desktop distribution
         run: |
           ./gradlew :desktop:installDist --stacktrace
+          test -x desktop/build/install/desktop/bin/offcon-desktop
+          test -x desktop/build/install/desktop/bin/llama-server
           cd desktop/build/install
           zip -r "$GITHUB_WORKSPACE/OffconAI-desktop-linux-x86_64.zip" desktop
           cp "$GITHUB_WORKSPACE/OffconAI-desktop-linux-x86_64.zip" "$GITHUB_WORKSPACE/OffconAI-desktop.zip"

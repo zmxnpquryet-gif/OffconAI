@@ -5,7 +5,8 @@ use crate::contracts::{
     StreamEvent,
 };
 use crate::process::{
-    default_threads, log_path, log_tail, resolve_executable, spawn_with_log, wait_for, ProcessSlot,
+    default_threads, log_path, log_tail, resolve_executable, sanitize_path, spawn_with_log,
+    wait_for, ProcessSlot,
 };
 use crate::transport::OpenAiTransport;
 use std::path::Path;
@@ -87,7 +88,8 @@ impl LlmBackend for LlamaCpp {
             .map(str::trim)
             .filter(|path| !path.is_empty())
             .unwrap_or(&self.config.default_model_path);
-        if !Path::new(model_path).is_file() {
+        let sanitized = sanitize_path(model_path);
+        if !Path::new(&sanitized).is_file() {
             return Err("llama.cpp requires an existing local GGUF model path".into());
         }
         let executable = resolve_executable(&self.config.executable).ok_or_else(|| {
@@ -99,7 +101,7 @@ impl LlmBackend for LlamaCpp {
         let mut command = Command::new(&executable);
         command
             .arg("--model")
-            .arg(model_path)
+            .arg(&sanitized)
             .arg("--host")
             .arg(&self.config.host)
             .arg("--port")
