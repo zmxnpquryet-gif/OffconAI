@@ -200,12 +200,17 @@ internal fun MemoryGuardSettingsSection(
         )
         Spacer(modifier = Modifier.height(10.dp))
         SettingToggleRow(
-            title = stringResource(
+            // The switch controls automatic reduction; the level is status, not a label.
+            // A title of "Current level: 0 / 4" next to an on/off switch read as if the
+            // switch changed the level, and the localized "Automatic reduction" string
+            // existed but was never used.
+            title = stringResource(R.string.settings_memory_auto),
+            subtitle = memoryLevelDescription(memoryGuardState.level),
+            extraNote = stringResource(
                 R.string.settings_memory_level,
                 memoryGuardState.level,
                 MemoryGuardStore.MAX_LEVEL
             ),
-            subtitle = memoryLevelDescription(memoryGuardState.level),
             checked = memoryGuardState.enabled,
             onCheckedChange = onSetEnabled
         )
@@ -356,7 +361,7 @@ internal fun SamplingSettingsSection(
 
         Spacer(modifier = Modifier.height(8.dp))
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            GText("Top-K")
+            GText(stringResource(R.string.settings_top_k))
             GText(
                 text = "${settings.topK}",
                 style = GlassTheme.type.bodyMedium.copy(fontFamily = FontFamily.Monospace),

@@ -21,6 +21,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -159,23 +164,36 @@ internal fun TtsVoiceControls(
                 color = GlassTheme.colors.onSurfaceVariant
             )
             Spacer(modifier = Modifier.width(6.dp))
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                 items(LocalTtsEngine.SPEAKER_COUNT) { index ->
                     val active = index == speakerId
+                    val label = stringResource(R.string.voice_tts_speaker_item, index + 1)
+                    // 28dp visual chip inside a 48dp touch target, announced as a radio option.
                     Box(
                         modifier = Modifier
-                            .size(24.dp)
-                            .clip(CircleShape)
-                            .background(if (active) GlassTheme.colors.primary else GlassTheme.colors.surfaceVariant)
-                            .clickable { onSpeakerChange(index) },
+                            .size(48.dp)
+                            .semantics {
+                                contentDescription = label
+                                selected = active
+                                role = Role.RadioButton
+                            }
+                            .clickable(role = Role.RadioButton) { onSpeakerChange(index) },
                         contentAlignment = Alignment.Center
                     ) {
-                        GText(
-                            text = "${index + 1}",
-                            fontSize = 10.sp,
-                            fontFamily = FontFamily.Monospace,
-                            color = if (active) GlassTheme.colors.onPrimary else GlassTheme.colors.onSurface
-                        )
+                        Box(
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(CircleShape)
+                                .background(if (active) GlassTheme.colors.primary else GlassTheme.colors.surfaceVariant),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            GText(
+                                text = "${index + 1}",
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = if (active) GlassTheme.colors.onPrimary else GlassTheme.colors.onSurface
+                            )
+                        }
                     }
                 }
             }

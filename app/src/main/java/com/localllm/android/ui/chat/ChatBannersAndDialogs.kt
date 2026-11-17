@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.sp
 import com.localllm.android.R
 import com.localllm.android.engine.McpToolCall
 import com.localllm.android.ui.glass.GCard
+import com.localllm.android.ui.glass.GCompactIconButton
 import com.localllm.android.ui.glass.GDialog
 import com.localllm.android.ui.glass.GIcon
 import com.localllm.android.ui.glass.GIconButton
@@ -199,7 +200,7 @@ internal fun UpdateBanner(
                     style = GlassTheme.type.labelSmall,
                     color = GlassTheme.colors.primary
                 )
-                GIconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
+                GCompactIconButton(onClick = onDismiss) {
                     GIcon(
                         imageVector = GIcons.Close,
                         contentDescription = stringResource(R.string.update_banner_dismiss),

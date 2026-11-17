@@ -5,6 +5,7 @@ import com.localllm.android.engine.ToolTextSpans.indexOfOutsideFences
 import com.localllm.android.engine.ToolTextSpans.matchDelimited
 import com.localllm.android.engine.ToolTextSpans.stripCodeFence
 import com.localllm.android.engine.ToolTextSpans.stripRanges
+import com.localllm.android.model.MessageRole
 import com.localllm.android.model.ToolCallTemplate
 import org.json.JSONArray
 import org.json.JSONObject
@@ -70,6 +71,12 @@ object McpToolProtocol {
     /** Tool output beyond this is cut so a chatty tool cannot blow the context window. */
     const val MAX_RESULT_CHARS = 4000
 
+    /** Rolling prompt history window: four (user, assistant) pairs. */
+    const val MAX_HISTORY_ENTRIES = 8
+
+    private const val DECLINED_RESULT = "The user declined to run this tool."
+    private const val SKIPPED_RESULT = "Skipped: an earlier tool call in this turn was declined."
+
     /** Dialects the parser knows, in recovery order. */
     private val DIALECTS = listOf(
         ToolCallTemplate.HERMES,
@@ -87,6 +94,35 @@ object McpToolProtocol {
     )
 
     private const val QWEN_FN_OPEN = "<function="
+
+    /**
+     * Literals that open or close a block hidden from the visible answer.
+     *
+     * A streaming consumer must never publish a trailing fragment that could still
+     * grow into one of these: once a fragment like `<tool_ca` is on the wire, the
+     * markup it turns into cannot be retracted.
+     */
+    val STREAM_HOLDBACK_MARKERS: List<String> = listOf(
+        OPEN,
+        CLOSE,
+        QWEN_FN_OPEN,
+        Gemma4ToolCodec.GEMMA4_OPEN,
+        Gemma4ToolCodec.GEMMA4_CLOSE,
+        Gemma4ToolCodec.LFM_PY_OPEN,
+        Gemma4ToolCodec.LFM_PY_CLOSE,
+        MINICPM5_OPEN,
+        MINICPM5_CLOSE,
+        LLAMA_TAG,
+        MISTRAL_OPEN,
+        GLM4_CLOSE,
+        DEEPSEEK_CALLS_BEGIN,
+        DEEPSEEK_CALL_BEGIN,
+        DEEPSEEK_CALL_END,
+        DEEPSEEK_CALLS_END,
+        DEEPSEEK_NAME,
+        DEEPSEEK_SEP,
+        COHERE_FIELD
+    )
 
     /**
      * System-prompt block describing the connected tools and how to call them in the
@@ -295,8 +331,17 @@ object McpToolProtocol {
         // ignore the wrapper. It stays available for Hermes/QwenXml/auto only, so a normal
         // answer full of JSON is not mistaken for a call under another dialect.
         if (dialect == ToolCallTemplate.HERMES || dialect == ToolCallTemplate.QWEN_XML || dialect == ToolCallTemplate.AUTO) {
-            val standalone = tryStandaloneJson(text, available)
-            if (standalone != null) return ToolCallBatch(listOf(standalone), "")
+            when (val standalone = tryStandaloneJson(text, available)) {
+                is Decoded.Valid -> return ToolCallBatch(listOf(standalone.call), "")
+                // Tool-shaped JSON (a name plus arguments/parameters) that failed
+                // validation is a mistyped call, not prose: surface the reason so
+                // the model corrects the name/args instead of silently dropping it.
+                // Plain JSON without a tool shape still reads as a normal answer.
+                is Decoded.Invalid -> if (hasStandaloneToolShape(text)) {
+                    return ToolCallBatch(emptyList(), text, listOf(standalone.reason), false)
+                }
+                null -> {}
+            }
         }
         if (text.contains(Gemma4ToolCodec.LFM_PY_OPEN)) {
             val py = collectLfmPythonic(text, available)
@@ -1053,6 +1098,45 @@ object McpToolProtocol {
             .trim()
     }
 
+    /**
+     * The longest prefix of a *streaming* visible answer that a later token cannot
+     * change.
+     *
+     * `visibleText` strips a tool block once its opening marker is complete and trims
+     * the prose around it, so two kinds of suffix are not stable yet: trailing
+     * whitespace (it disappears when a block opens right there) and a trailing fragment
+     * that a marker could complete. Publishing them makes the answer flicker — a frame
+     * shows `<tool_ca` and the next one cannot take it back. A consumer that streams to
+     * a screen or a socket publishes only this prefix and flushes the rest when the turn
+     * is complete.
+     */
+    fun stableVisiblePrefix(text: String): String {
+        var end = text.length
+        var passes = longestMarkerLength + 1
+        while (passes-- > 0) {
+            while (end > 0 && text[end - 1].isWhitespace()) end--
+            val cut = markerFragmentStart(text, end)
+            if (cut == end) break
+            end = cut
+        }
+        return if (end == text.length) text else text.substring(0, end)
+    }
+
+    /** Start index of a trailing fragment of `text[0, end)` that a marker could complete. */
+    private fun markerFragmentStart(text: String, end: Int): Int {
+        val longestCheck = minOf(end, longestMarkerLength - 1)
+        for (length in longestCheck downTo 1) {
+            val start = end - length
+            val completing = STREAM_HOLDBACK_MARKERS.any { marker ->
+                marker.length > length && marker.regionMatches(0, text, start, length)
+            }
+            if (completing) return start
+        }
+        return end
+    }
+
+    private val longestMarkerLength: Int = STREAM_HOLDBACK_MARKERS.maxOf { it.length }
+
     fun encodeCall(
         call: McpToolCall,
         template: ToolCallTemplate = ToolCallTemplate.HERMES
@@ -1143,19 +1227,92 @@ object McpToolProtocol {
         return out
     }
 
-    fun formatExecutions(executions: List<ToolExecution>): String = executions.joinToString("\n") { execution ->
+    /**
+     * Gives every call of an executed batch its own outcome.
+     *
+     * [executeBatch] stops at the first decline so nothing runs behind the user's back,
+     * which leaves the later calls without a result. The turn still announced those
+     * calls to the model in the assistant echo, so they are closed out here as
+     * declined-and-skipped: a committed call must never reach the model — or the
+     * transcript — without a matching result.
+     */
+    fun completeUnexecuted(
+        calls: List<McpToolCall>,
+        executions: List<ToolExecution>
+    ): List<ToolExecution> {
+        if (executions.size >= calls.size) return executions
+        val out = executions.toMutableList()
+        for (index in executions.size until calls.size) {
+            out += ToolExecution(calls[index], approved = false, declined = true, skipped = true)
+        }
+        return out
+    }
+
+    /** Transcript text for one call outcome, shared by the chat log and the prompt block. */
+    fun resultText(execution: ToolExecution): String {
         if (execution.declined) {
-            formatResult(execution.call.name, false, "The user declined to run this tool.")
-        } else {
-            val result = execution.result
-            val output = if (result == null) "" else result.text.ifBlank { result.message }
-            formatResult(
+            return formatResult(
                 execution.call.name,
-                result?.isSuccess == true,
-                output
+                false,
+                if (execution.skipped) SKIPPED_RESULT else DECLINED_RESULT
             )
         }
+        val result = execution.result
+        val output = if (result == null) "" else result.text.ifBlank { result.message }
+        return formatResult(execution.call.name, result?.isSuccess == true, output)
     }
+
+    fun formatExecutions(executions: List<ToolExecution>): String =
+        executions.joinToString("\n") { resultText(it) }
+
+    /**
+     * Appends one (user prompt, assistant reply) pair and keeps the rolling window
+     * aligned.
+     *
+     * A plain `takeLast(n)` can cut a pair in half — the reply then answers a question
+     * the model can no longer see — and it can leave an assistant entry first, which
+     * some chat templates reject outright. Cutting in whole pairs and dropping a
+     * leading assistant entry keeps both invariants.
+     */
+    fun appendTurnPair(
+        history: List<Pair<String, String>>,
+        userTurn: String,
+        assistantTurn: String,
+        maxEntries: Int = MAX_HISTORY_ENTRIES
+    ): List<Pair<String, String>> {
+        val combined = history +
+            (MessageRole.USER.name to userTurn) +
+            (MessageRole.ASSISTANT.name to assistantTurn)
+        return trimHistory(combined, maxEntries)
+    }
+
+    /**
+     * Keeps at most [maxEntries] trailing entries of a prompt history with the first
+     * entry a user turn. Database history can start anywhere (a tool result, or an
+     * assistant reply whose question fell out of the window), so it is normalized here
+     * before it is used as prompt history.
+     */
+    fun trimHistory(
+        history: List<Pair<String, String>>,
+        maxEntries: Int = MAX_HISTORY_ENTRIES
+    ): List<Pair<String, String>> {
+        if (history.isEmpty()) return history
+        val tail = history.takeLast(maxEntries.coerceAtLeast(1))
+        val firstUser = tail.indexOfFirst { it.first.equals("user", ignoreCase = true) }
+        if (firstUser < 0) return emptyList()
+        return tail.subList(firstUser, tail.size).toList()
+    }
+
+    /**
+     * Feedback for a turn that still asked for tools after the round budget was spent.
+     * Recorded instead of dropping the request silently: the caller never ran those
+     * calls, so the user has to be able to see why.
+     */
+    fun formatRoundBudgetExhausted(limit: Int = MAX_TOOL_ROUNDS): String =
+        formatInvalid(
+            "The tool-round limit ($limit) has been reached for this message, so no " +
+                "further tool calls can be run. Answer with the information already available."
+        )
 
     /** Wraps a tool outcome as untrusted data for the next model turn. */
     fun formatResult(toolName: String, success: Boolean, output: String): String {
@@ -1290,10 +1447,16 @@ object McpToolProtocol {
         }
     }
 
-    private fun tryStandaloneJson(text: String, available: List<McpTool>): McpToolCall? {
+    private fun tryStandaloneJson(text: String, available: List<McpTool>): Decoded? {
         val trimmed = text.trim()
         if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return null
-        return (decodeCall(trimmed, available) as? Decoded.Valid)?.call
+        return decodeCall(trimmed, available)
+    }
+
+    private fun hasStandaloneToolShape(text: String): Boolean {
+        val obj = parseObject(text.trim()) ?: return false
+        if (obj.has("function")) return true
+        return obj.has("arguments") || obj.has("parameters")
     }
 
     private fun parseObject(raw: String): JSONObject? = try {

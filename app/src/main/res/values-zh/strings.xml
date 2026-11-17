@@ -656,4 +656,45 @@
     <string name="chat_empty_suggest_api">如何通过本地 API 连接？</string>
     <string name="chat_empty_footer">无账户 · 无遥测 · 离线推理</string>
     <string name="chat_input_hint">消息</string>
+
+    <!-- Composer: attachments, status strip, touch/semantics copy -->
+    <string name="chat_attachment_image">图片</string>
+    <string name="chat_attachment_file">文件</string>
+    <string name="chat_attachment_remove">移除附件</string>
+    <string name="chat_status_prefill">正在处理提示词 · %1$s tok/s</string>
+    <string name="chat_status_generating">正在生成…</string>
+    <string name="chat_status_metrics">%1$s tok/s · %2$d ctx</string>
+    <string name="chat_status_loading_progress">%1$s · %2$d%%</string>
+    <string name="chat_status_preparing_image">正在准备图像输入…</string>
+    <string name="chat_state_ready_to_send">可以发送</string>
+    <string name="chat_state_streaming">正在生成 · 点按停止</string>
+    <string name="chat_send_disabled_hint">输入消息或附加文件后即可发送</string>
+    <string name="chat_reasoning_effort_with_value">%1$s (%2$s)</string>
+    <string name="chat_reasoning_effort_expand">调整推理强度</string>
+    <string name="chat_state_expanded">已展开</string>
+    <string name="chat_state_collapsed">已折叠</string>
+    <string name="chat_attach_opening">正在打开选择器…</string>
+    <string name="chat_library_empty">库中还没有文档。附加 PDF、XLSX、PPTX 或文本文件即可在本对话中检索。</string>
+
+    <!-- Voice screen: native-audio facts, explicit states, microphone semantics -->
+    <string name="voice_native_session_title">原生音频会话</string>
+    <string name="voice_native_session_desc">麦克风音频（16 kHz PCM）直接传给模型，回复文本与语音一起到达。</string>
+    <string name="voice_native_model_fallback">原生音频模型</string>
+    <string name="voice_mode_header_native">%1$s · 原生音频输入 → 语音输出 · 每轮点按一次</string>
+    <string name="voice_state_error">语音对话因错误而停止</string>
+    <string name="voice_status_label_idle">空闲</string>
+    <string name="voice_status_label_listening">聆听中</string>
+    <string name="voice_status_label_thinking">思考中</string>
+    <string name="voice_status_label_speaking">说话中</string>
+    <string name="voice_status_label_error">错误</string>
+    <string name="voice_error_dismiss">关闭</string>
+    <string name="voice_mic_mute">静音麦克风</string>
+    <string name="voice_mic_unmute">取消麦克风静音</string>
+    <string name="voice_tts_speaker_item">说话人 %1$d</string>
+
+    <!-- Settings / drawer usability copy -->
+    <string name="settings_api_server_off_hint">服务器已停止。打开开关即可处理请求。</string>
+    <string name="settings_theme_swatch_desc">%1$s 主题</string>
+    <string name="drawer_recent_chats">最近的对话</string>
+    <string name="drawer_tools">工具</string>
 </resources>

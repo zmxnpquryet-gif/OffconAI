@@ -52,11 +52,17 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import kotlin.math.roundToInt
 
-/** Glass toggle replacing M3 Switch (48dp touch target, switch semantics). */
+/**
+ * Glass toggle replacing M3 Switch (48dp touch target, switch semantics).
+ *
+ * A null [onCheckedChange] renders a non-interactive indicator: the row that owns the
+ * switch stays the single toggleable node, so TalkBack never sees two overlapping
+ * switches for one setting and a tap can never toggle twice.
+ */
 @Composable
 fun GSwitch(
     checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit,
+    onCheckedChange: ((Boolean) -> Unit)?,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
     activeColor: Color = GlassTheme.colors.primary
@@ -65,14 +71,21 @@ fun GSwitch(
     val thumbOffset by animateFloatAsState(
         targetValue = if (checked) 1f else 0f, label = "switch"
     )
+    val onChange = onCheckedChange
     Box(
         modifier = modifier
             .size(width = 52.dp, height = 48.dp)
-            .toggleable(
-                value = checked,
-                enabled = enabled,
-                role = Role.Switch,
-                onValueChange = onCheckedChange
+            .then(
+                if (onChange != null) {
+                    Modifier.toggleable(
+                        value = checked,
+                        enabled = enabled,
+                        role = Role.Switch,
+                        onValueChange = onChange
+                    )
+                } else {
+                    Modifier
+                }
             ),
         contentAlignment = Alignment.Center
     ) {

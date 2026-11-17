@@ -12,6 +12,7 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
+import com.localllm.android.model.ToolCallTemplate
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -471,5 +472,145 @@ class McpToolProtocolTest {
         withTimeout(5000) { job.cancelAndJoin() }
         assertTrue(job.isCancelled)
         Unit
+    }
+
+    // ---------------- standalone JSON fallback ----------------
+
+    @Test
+    fun `standalone valid call to a known tool is accepted`() {
+        val batch = McpToolProtocol.parseBatch(
+            text = """{"name": "get_weather", "arguments": {"city": "Seoul"}}""",
+            available = tools,
+            template = ToolCallTemplate.HERMES
+        )
+        assertEquals(1, batch.calls.size)
+        assertTrue(batch.errors.isEmpty())
+        assertEquals("get_weather", batch.calls.single().name)
+    }
+
+    @Test
+    fun `standalone mistyped tool name feeds back an error instead of prose`() {
+        val batch = McpToolProtocol.parseBatch(
+            text = """{"name": "get_weathr", "arguments": {}}""",
+            available = tools,
+            template = ToolCallTemplate.HERMES
+        )
+        assertTrue(batch.calls.isEmpty())
+        assertEquals(1, batch.errors.size)
+    }
+
+    @Test
+    fun `plain json without a tool shape stays prose`() {
+        val text = """{"name": "Ada"}"""
+        val batch = McpToolProtocol.parseBatch(
+            text = text,
+            available = tools,
+            template = ToolCallTemplate.HERMES
+        )
+        assertTrue(batch.calls.isEmpty())
+        assertTrue(batch.errors.isEmpty())
+        assertEquals(text, batch.prose)
+    }
+
+    // ---------------- batch integrity: declines, history, round budget ----------------
+
+    @Test
+    fun `a declined batch still leaves one result per announced call`() = runBlocking {
+        val calls = listOf(
+            McpToolCall("add", "{}"),
+            McpToolCall("get_weather", """{"city":"Seoul"}"""),
+            McpToolCall("add", """{"a":1}""")
+        )
+        val invoked = mutableListOf<String>()
+        val executions = McpToolProtocol.executeBatch(
+            calls,
+            approval = ToolApprovalPolicy { it.argumentsJson == "{}" },
+            invoker = ToolInvoker { invoked += it.name; McpToolCallResult(true, "ok", "") }
+        )
+        // The decline stops execution: nothing may run behind the user's back.
+        assertEquals(listOf("add"), invoked)
+        assertEquals(2, executions.size)
+
+        val completed = McpToolProtocol.completeUnexecuted(calls, executions)
+        assertEquals(calls.map { it.name }, completed.map { it.call.name })
+        assertTrue(completed.last().declined)
+        assertTrue("the unexecuted call is marked skipped", completed.last().skipped)
+
+        val transcript = McpToolProtocol.formatExecutions(completed)
+        assertEquals(3, Regex("<tool_result ").findAll(transcript).count())
+        assertTrue(transcript.contains("declined"))
+        assertTrue(transcript.contains("Skipped"))
+    }
+
+    @Test
+    fun `completing a fully executed batch changes nothing`() {
+        val calls = listOf(McpToolCall("add", "{}"))
+        val execution = ToolExecution(calls.single(), approved = true, result = McpToolCallResult(true, "ok", ""))
+        assertEquals(listOf(execution), McpToolProtocol.completeUnexecuted(calls, listOf(execution)))
+    }
+
+    @Test
+    fun `prompt history never starts with an assistant entry`() {
+        val messy = listOf(
+            "ASSISTANT" to "reply whose question fell out of the window",
+            "USER" to "q1",
+            "ASSISTANT" to "a1"
+        )
+        val trimmed = McpToolProtocol.trimHistory(messy, maxEntries = 3)
+        assertEquals(listOf("q1", "a1"), trimmed.map { it.second })
+        assertEquals("USER", trimmed.first().first)
+    }
+
+    @Test
+    fun `appending a round keeps whole pairs inside the window`() {
+        var history = emptyList<Pair<String, String>>()
+        repeat(5) { index ->
+            history = McpToolProtocol.appendTurnPair(history, "prompt$index", "reply$index")
+        }
+        assertTrue(history.size <= McpToolProtocol.MAX_HISTORY_ENTRIES)
+        assertEquals(0, history.size % 2)
+        assertEquals("USER", history.first().first)
+        assertEquals("USER", history[history.size - 2].first)
+        assertEquals("prompt4", history[history.size - 2].second)
+        assertEquals("reply4", history.last().second)
+    }
+
+    @Test
+    fun `a tool call after the round budget is reported instead of hidden`() {
+        val budget = com.localllm.android.ui.controllers.ToolRoundBudget()
+        repeat(McpToolProtocol.MAX_TOOL_ROUNDS) { budget.onToolRound() }
+        assertTrue(budget.isExhausted())
+        assertFalse(budget.canRequestTools())
+
+        // The model asked again anyway. The parser does see the call, which is why the
+        // turn has to record that it cannot run instead of showing the block as prose.
+        val text = """<tool_call>{"name":"add","arguments":{}}</tool_call>"""
+        val batch = McpToolProtocol.parseBatch(text, tools, template = ToolCallTemplate.HERMES)
+        assertEquals(1, batch.calls.size)
+
+        val notice = McpToolProtocol.formatRoundBudgetExhausted()
+        assertTrue(notice.startsWith("<tool_result status=\"error\">"))
+        assertTrue(notice.contains(McpToolProtocol.MAX_TOOL_ROUNDS.toString()))
+        // The notice is data, not a second result block that could be closed early.
+        assertEquals(1, Regex("</tool_result>").findAll(notice).count())
+    }
+
+    @Test
+    fun `streaming holdback keeps partial markup and trailing space back`() {
+        assertEquals("Thinking", McpToolProtocol.stableVisiblePrefix("Thinking "))
+        assertEquals("Thinking", McpToolProtocol.stableVisiblePrefix("Thinking <"))
+        assertEquals("Thinking", McpToolProtocol.stableVisiblePrefix("Thinking <tool_ca"))
+        assertEquals(
+            "an open block is already hidden by visibleText",
+            "Thinking",
+            McpToolProtocol.stableVisiblePrefix(
+                McpToolProtocol.visibleText(
+                    "Thinking <tool_call>{\"name\":\"add\"}",
+                    ToolCallTemplate.HERMES
+                )
+            )
+        )
+        assertEquals("Thinking done", McpToolProtocol.stableVisiblePrefix("Thinking done"))
+        assertEquals("", McpToolProtocol.stableVisiblePrefix(""))
     }
 }

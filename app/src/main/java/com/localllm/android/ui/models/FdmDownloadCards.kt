@@ -27,6 +27,7 @@ import com.localllm.android.engine.IntegrityNote
 import com.localllm.android.model.LlmModel
 import com.localllm.android.model.ModelRuntimeType
 import com.localllm.android.ui.glass.GIcon
+import com.localllm.android.ui.glass.GCompactIconButton
 import com.localllm.android.ui.glass.GIconButton
 import com.localllm.android.ui.glass.GIcons
 import com.localllm.android.ui.glass.GLinearProgress
@@ -77,7 +78,7 @@ internal fun FdmActiveDownloadCard(
                     )
                 }
             }
-            GIconButton(onClick = onCancel, modifier = Modifier.size(28.dp)) {
+            GCompactIconButton(onClick = onCancel) {
                 GIcon(
                     imageVector = GIcons.Close,
                     contentDescription = stringResource(R.string.cancel),
