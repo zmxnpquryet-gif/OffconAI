@@ -7,6 +7,9 @@ import { Card, CheckRow, Field, FieldLabel, FlatButton, SectionLabel, StatusDot 
 export component RuntimeSidebar inherits Rectangle {
     in property <int> backend-index;
     in property <bool> busy;
+    // "loading" | "unloading" | "connecting" | … so the runtime card can say what it is
+    // doing instead of showing one undifferentiated busy state.
+    in property <string> phase;
     in property <bool> model-loaded;
     in property <bool> mcp-connected;
     in property <string> mcp-status;
@@ -76,7 +79,7 @@ export component RuntimeSidebar inherits Rectangle {
                         height: 36px;
 
                         FlatButton {
-                            label: "Load / connect";
+                            label: root.phase == "loading" ? "Loading…" : root.phase == "unloading" ? "Unloading…" : "Load / connect";
                             primary: true;
                             button-enabled: !root.busy;
                             horizontal-stretch: 1;
@@ -90,9 +93,31 @@ export component RuntimeSidebar inherits Rectangle {
                         }
                     }
 
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        Rectangle {
+                            width: 6px;
+                            height: 14px;
+                            background: transparent;
+                            StatusDot {
+                                y: 4px;
+                                active: root.model-loaded;
+                            }
+                        }
+                        Text {
+                            text: root.model-loaded ? "runtime loaded" : (root.phase == "" ? "runtime idle" : root.phase + "…");
+                            font-size: 11px;
+                            font-family: Ui.font-mono;
+                            color: Ui.muted;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+
                     FlatButton {
                         label: "New conversation";
-                        button-enabled: !root.busy;
+                        button-enabled: true;
                         height: 32px;
                         clicked => { root.new-chat-requested(); }
                     }
@@ -354,6 +379,13 @@ export component RuntimeSidebar inherits Rectangle {
                 text: "Models and prompts stay on hardware you control.";
                 font-size: 11px;
                 color: Ui.muted;
+            }
+            Text {
+                text: "Esc stop \u{00B7} Ctrl+N new \u{00B7} Ctrl+L focus \u{00B7} F5 reload";
+                font-size: 11px;
+                font-family: Ui.font-mono;
+                color: Ui.muted;
+                wrap: TextWrap.word-wrap;
             }
         }
     }

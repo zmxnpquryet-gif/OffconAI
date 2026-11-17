@@ -3,10 +3,13 @@
 pub mod backends;
 pub mod contracts;
 pub mod controller;
+pub mod epoch;
 pub mod image_backend;
 pub mod mcp;
+pub mod persist;
 pub mod process;
 pub mod session;
+pub mod stream_batch;
 pub mod transport;
 
 slint::include_modules!();
