@@ -28,12 +28,19 @@ internal object HttpWireWriter {
         output.flush()
     }
 
+    fun sendContinue(output: OutputStream) {
+        output.write("HTTP/1.1 100 Continue\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
+        output.flush()
+    }
+
     fun sendStreamHeaders(output: OutputStream, contentType: String, origin: String?) {
         val allowedOrigin = validatedCorsOrigin(origin)
         val header = buildString {
             append("HTTP/1.1 200 OK\r\n")
             append("Content-Type: $contentType; charset=utf-8\r\n")
             append("Transfer-Encoding: chunked\r\n")
+            append("Cache-Control: no-cache\r\n")
+            append("X-Accel-Buffering: no\r\n")
             append("Connection: close\r\n")
             appendCorsHeaders(allowedOrigin)
             append("\r\n")
@@ -45,8 +52,7 @@ internal object HttpWireWriter {
     fun sendChunk(output: OutputStream, text: String) {
         val bytes = text.toByteArray(StandardCharsets.UTF_8)
         if (bytes.isEmpty()) return
-        output.write(Integer.toHexString(bytes.size).toByteArray(StandardCharsets.US_ASCII))
-        output.write("\r\n".toByteArray(StandardCharsets.US_ASCII))
+        output.write("${Integer.toHexString(bytes.size)}\r\n".toByteArray(StandardCharsets.US_ASCII))
         output.write(bytes)
         output.write("\r\n".toByteArray(StandardCharsets.US_ASCII))
         output.flush()
@@ -89,6 +95,7 @@ internal object HttpWireWriter {
     }
 
     private fun StringBuilder.appendCorsHeaders(allowedOrigin: String?) {
+        append("Vary: Origin\r\n")
         if (allowedOrigin != null) {
             append("Access-Control-Allow-Origin: $allowedOrigin\r\n")
             append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n")

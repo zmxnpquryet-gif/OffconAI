@@ -1,8 +1,9 @@
 //! UI-independent conversation state machine.
 //! Keeps turn rendering records, OpenAI request history, and multi-round tool calls synchronized.
 
-use crate::contracts::{ChatMessage, ChatRequest, ToolCallRecord, ToolDefinition};
+use crate::contracts::{ChatMessage, ChatRequest, OpenAiToolCall, ToolCallRecord, ToolDefinition};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 pub const KIND_USER: i32 = 0;
 pub const KIND_ASSISTANT: i32 = 1;
@@ -10,11 +11,20 @@ pub const KIND_REASONING: i32 = 2;
 pub const KIND_TOOL: i32 = 3;
 pub const KIND_ERROR: i32 = 4;
 
+const MAX_HISTORY_MESSAGES: usize = 40;
+const MAX_HISTORY_ESTIMATED_TOKENS: usize = 16_000;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnEntry {
     pub kind: i32,
     pub role: String,
     pub body: String,
+}
+
+#[derive(Clone, Debug)]
+struct PendingTool {
+    id: String,
+    name: String,
 }
 
 #[derive(Default)]
@@ -25,6 +35,8 @@ pub struct ConversationSession {
     active_assistant_idx: Option<usize>,
     active_assistant_text: String,
     active_tool_calls: Vec<ToolCallRecord>,
+    pending_batch: Vec<PendingTool>,
+    next_call_seq: u64,
     pub had_error: bool,
 }
 
@@ -48,7 +60,12 @@ impl ConversationSession {
         self.active_assistant_idx = None;
         self.active_assistant_text.clear();
         self.active_tool_calls.clear();
+        self.pending_batch.clear();
         self.had_error = false;
+    }
+
+    pub fn has_pending_tools(&self) -> bool {
+        !self.pending_batch.is_empty()
     }
 
     pub fn begin_user_turn(
@@ -80,7 +97,12 @@ impl ConversationSession {
         temperature: f64,
         max_tokens: u32,
     ) -> ChatRequest {
-        let mut req = ChatRequest::text(self.messages.clone());
+        let prepared = trim_and_repair_history(
+            &self.messages,
+            MAX_HISTORY_MESSAGES,
+            MAX_HISTORY_ESTIMATED_TOKENS,
+        );
+        let mut req = ChatRequest::text(prepared);
         req.tools = tools;
         req.temperature = temperature;
         req.max_tokens = max_tokens;
@@ -167,16 +189,61 @@ impl ConversationSession {
             .clone()
             .filter(|id| !id.is_empty())
             .unwrap_or_else(|| format!("call_{index}"));
+        self.pending_batch.retain(|item| item.id != call_id);
+        self.push_tool_result_entry(call_id, &call.name, output, ok)
+    }
+
+    /// Resolves a single pending tool call by ID. Returns `None` if this ID is
+    /// not pending (e.g. duplicate completion or already aborted).
+    pub fn resolve_tool(
+        &mut self,
+        call: &ToolCallRecord,
+        index: usize,
+        output: &str,
+        ok: bool,
+    ) -> Option<TurnEntry> {
+        let call_id = call
+            .id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| format!("call_{index}"));
+        let pos = self
+            .pending_batch
+            .iter()
+            .position(|item| item.id == call_id)?;
+        let pending = self.pending_batch.remove(pos);
+        Some(self.push_tool_result_entry(pending.id, &pending.name, output, ok))
+    }
+
+    /// Closes every unresolved tool call in the current batch with a synthetic
+    /// `role: "tool"` entry so the committed assistant `tool_calls` message never
+    /// becomes orphaned in history.
+    pub fn abort_pending_tools(&mut self, reason: &str) -> Vec<TurnEntry> {
+        let remaining = std::mem::take(&mut self.pending_batch);
+        let msg = format!("(not executed: {reason})");
+        remaining
+            .into_iter()
+            .map(|pending| self.push_tool_result_entry(pending.id, &pending.name, &msg, false))
+            .collect()
+    }
+
+    fn push_tool_result_entry(
+        &mut self,
+        call_id: String,
+        name: &str,
+        output: &str,
+        ok: bool,
+    ) -> TurnEntry {
         let status = if ok { "ok" } else { "error" };
         let truncated: String = output.chars().take(4000).collect();
         self.messages.push(ChatMessage::tool_result(
             call_id,
-            call.name.clone(),
+            name.to_string(),
             truncated.clone(),
         ));
         let entry = TurnEntry {
             kind: KIND_TOOL,
-            role: format!("Tool result ({status}) \u{00B7} {}", call.name),
+            role: format!("Tool result ({status}) \u{00B7} {name}"),
             body: if truncated.trim().is_empty() {
                 "(empty output)".into()
             } else {
@@ -199,6 +266,8 @@ impl ConversationSession {
     }
 
     /// Commits the current assistant turn and returns `(tool_calls, parsed_from_inline_text)`.
+    /// Also assigns unique IDs to calls lacking one and tracks them in `pending_batch`
+    /// so every exit path can guarantee complete `tool_calls` -> `tool` pairing.
     pub fn finish_turn(&mut self) -> (Vec<ToolCallRecord>, bool) {
         let mut calls = std::mem::take(&mut self.active_tool_calls);
         let mut from_inline = false;
@@ -218,11 +287,39 @@ impl ConversationSession {
         self.active_assistant_text.clear();
 
         if !calls.is_empty() {
-            for (idx, call) in calls.iter_mut().enumerate() {
-                if call.id.as_deref().unwrap_or("").is_empty() {
-                    call.id = Some(format!("call_{idx}"));
+            let mut used_ids: HashSet<String> = self
+                .messages
+                .iter()
+                .filter_map(|m| m.tool_calls.as_ref())
+                .flatten()
+                .map(|c| c.id.clone())
+                .collect();
+            for call in calls.iter_mut() {
+                let needs_id = call
+                    .id
+                    .as_deref()
+                    .map(|id| id.trim().is_empty() || used_ids.contains(id))
+                    .unwrap_or(true);
+                if needs_id {
+                    loop {
+                        self.next_call_seq += 1;
+                        let candidate = format!("call_{}", self.next_call_seq);
+                        if used_ids.insert(candidate.clone()) {
+                            call.id = Some(candidate);
+                            break;
+                        }
+                    }
+                } else if let Some(id) = call.id.clone() {
+                    used_ids.insert(id);
                 }
             }
+            self.pending_batch = calls
+                .iter()
+                .map(|call| PendingTool {
+                    id: call.id.clone().unwrap_or_default(),
+                    name: call.name.clone(),
+                })
+                .collect();
             self.messages
                 .push(ChatMessage::assistant_with_tool_calls(clean_prose, &calls));
         } else if !clean_prose.is_empty() {
@@ -234,6 +331,111 @@ impl ConversationSession {
         self.active_assistant_idx = None;
         (calls, from_inline)
     }
+}
+
+fn estimate_message_tokens(msg: &ChatMessage) -> usize {
+    let mut chars = msg.content.len();
+    if let Some(calls) = &msg.tool_calls {
+        for call in calls {
+            chars += call.function.name.len() + call.function.arguments.len() + 24;
+        }
+    }
+    (chars / 4).max(4) + 4
+}
+
+/// Keeps the most recent messages within both count and approximate token budgets,
+/// preserving leading system messages and repairing any cut edge so an OpenAI-strict
+/// server never sees an orphan `role: "tool"` result or an assistant `tool_calls`
+/// message whose results were partially/fully dropped.
+pub fn trim_and_repair_history(
+    messages: &[ChatMessage],
+    max_messages: usize,
+    max_tokens: usize,
+) -> Vec<ChatMessage> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+    let system_end = messages
+        .iter()
+        .take_while(|m| m.role == "system")
+        .count();
+    let tail = &messages[system_end..];
+    let system_tokens: usize = messages[..system_end]
+        .iter()
+        .map(estimate_message_tokens)
+        .sum();
+    let tail_budget = max_tokens.saturating_sub(system_tokens);
+    let tail_limit = max_messages.saturating_sub(system_end).max(1);
+
+    let mut kept_rev = Vec::new();
+    let mut used_tokens = 0usize;
+    for msg in tail.iter().rev() {
+        let est = estimate_message_tokens(msg);
+        if !kept_rev.is_empty()
+            && (kept_rev.len() >= tail_limit || used_tokens + est > tail_budget)
+        {
+            break;
+        }
+        used_tokens += est;
+        kept_rev.push(msg.clone());
+    }
+    kept_rev.reverse();
+
+    // Seam repair at the cut edge: drop leading orphan `tool` messages whose
+    // assistant `tool_calls` message fell before the window.
+    while kept_rev.first().is_some_and(|m| m.role == "tool") {
+        kept_rev.remove(0);
+    }
+
+    let mut combined: Vec<ChatMessage> = messages[..system_end].to_vec();
+    combined.extend(kept_rev);
+    normalize_history(&mut combined);
+    combined
+}
+
+/// Ensures every assistant `tool_calls` entry in `messages` is paired with its
+/// corresponding `role: "tool"` results, and drops any orphan `tool` messages.
+pub fn normalize_history(messages: &mut Vec<ChatMessage>) {
+    let mut satisfied_ids: HashSet<String> = messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .filter_map(|m| m.tool_call_id.clone())
+        .collect();
+
+    // Remove `tool_calls` from any assistant message that lacks a matching result,
+    // or prune individual unsatisfied calls.
+    let mut valid_call_ids: HashSet<String> = HashSet::new();
+    for msg in messages.iter_mut() {
+        if msg.role == "assistant" {
+            if let Some(calls) = msg.tool_calls.take() {
+                let kept: Vec<OpenAiToolCall> = calls
+                    .into_iter()
+                    .filter(|c| satisfied_ids.contains(&c.id))
+                    .collect();
+                if !kept.is_empty() {
+                    for c in &kept {
+                        valid_call_ids.insert(c.id.clone());
+                    }
+                    msg.tool_calls = Some(kept);
+                }
+            }
+        }
+    }
+
+    // Drop orphan tool results whose assistant `tool_calls` were dropped/trimmed,
+    // and empty assistant placeholders whose dangling tool_calls were stripped.
+    messages.retain(|m| {
+        if m.role == "tool" {
+            m.tool_call_id
+                .as_deref()
+                .is_some_and(|id| valid_call_ids.contains(id))
+        } else if m.role == "assistant" && m.tool_calls.is_none() && m.content.trim().is_empty() {
+            false
+        } else {
+            true
+        }
+    });
+    let _ = &mut satisfied_ids;
 }
 
 fn strip_inline_tool_blocks(text: &str) -> String {
@@ -376,5 +578,72 @@ mod tests {
         assert_eq!(calls[0].name, "get_weather");
         assert_eq!(calls[0].arguments, r#"{"city":"Seoul"}"#);
         assert_eq!(strip_inline_tool_blocks(xml), "Checking.");
+    }
+
+    #[test]
+    fn batch_integrity_resolves_once_and_aborts_remainder() {
+        let mut session = ConversationSession::new();
+        session.begin_user_turn("run tools", Vec::new(), 0.7, 512);
+        session.push_tool_call(ToolCallRecord {
+            id: None,
+            name: "alpha".into(),
+            arguments: "{}".into(),
+        });
+        session.push_tool_call(ToolCallRecord {
+            id: None,
+            name: "beta".into(),
+            arguments: "{}".into(),
+        });
+        let (calls, _) = session.finish_turn();
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0].id, calls[1].id);
+        assert!(session.has_pending_tools());
+
+        assert!(session.resolve_tool(&calls[0], 0, "ok-a", true).is_some());
+        // Duplicate worker completion is ignored safely.
+        assert!(session.resolve_tool(&calls[0], 0, "ok-a", true).is_none());
+
+        let aborted = session.abort_pending_tools("declined");
+        assert_eq!(aborted.len(), 1);
+        assert!(!session.has_pending_tools());
+
+        // Assistant message has 2 calls, followed by 2 tool results -> both survive normalization.
+        let req = session.build_request(Vec::new(), 0.7, 512);
+        let tool_msgs: Vec<_> = req.messages.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(tool_msgs.len(), 2);
+        assert!(tool_msgs[1].content.contains("declined"));
+    }
+
+    #[test]
+    fn trim_and_repair_drops_cut_orphans_and_preserves_system() {
+        let mut msgs = vec![ChatMessage::new("system", "sys")];
+        for i in 0..30 {
+            msgs.push(ChatMessage::new("user", format!("u{i}")));
+            let call = ToolCallRecord {
+                id: Some(format!("id_{i}")),
+                name: "t".into(),
+                arguments: "{}".into(),
+            };
+            msgs.push(ChatMessage::assistant_with_tool_calls("", &[call]));
+            msgs.push(ChatMessage::tool_result(format!("id_{i}"), "t", "res"));
+        }
+        // Cut inside the middle of a tool-call/result pair by keeping 10 messages.
+        let trimmed = trim_and_repair_history(&msgs, 10, 16_000);
+        assert_eq!(trimmed[0].role, "system");
+        assert!(trimmed.len() <= 10);
+        assert_ne!(trimmed[1].role, "tool");
+        // Every assistant tool_call in `trimmed` has its matching tool result.
+        let result_ids: HashSet<_> = trimmed
+            .iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+        for msg in &trimmed {
+            if let Some(calls) = &msg.tool_calls {
+                for call in calls {
+                    assert!(result_ids.contains(&call.id));
+                }
+            }
+        }
     }
 }

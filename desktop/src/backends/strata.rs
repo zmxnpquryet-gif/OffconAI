@@ -4,7 +4,9 @@ use crate::contracts::{
     BackendCapabilities, BackendKind, ChatRequest, LlmBackend, ModelSpec, ResourceSnapshot,
     StreamEvent,
 };
-use crate::process::{log_path, log_tail, spawn_with_log, wait_for, ProcessSlot};
+use crate::process::{
+    log_path, log_tail, spawn_with_log, wait_for_process_health, ProcessSlot, WaitOutcome,
+};
 use crate::transport::OpenAiTransport;
 use std::path::PathBuf;
 use std::process::Command;
@@ -74,6 +76,7 @@ impl LlmBackend for Strata {
     }
 
     fn load(&self, model: &ModelSpec) -> Result<(), String> {
+        self.unload();
         if self.config.base_url.trim().is_empty() {
             return Err(
                 "Strata adapter requires a configured OpenAI-compatible gateway endpoint".into(),
@@ -93,19 +96,27 @@ impl LlmBackend for Strata {
             let child = spawn_with_log(command, &log)?;
             self.slot.store_child(child, log.clone());
             self.slot.set_loaded(&served);
-            if !wait_for(Duration::from_secs(30), || {
-                self.slot.alive()
-                    && self
-                        .transport
-                        .models_available(&self.config.base_url, self.config.api_key.as_deref())
+            match wait_for_process_health(&self.slot, Duration::from_secs(30), || {
+                self.transport
+                    .models_available(&self.config.base_url, self.config.api_key.as_deref())
             }) {
-                let tail = log_tail(Some(&log), 20);
-                self.slot.clear();
-                return Err(format!(
-                    "Launched Strata command did not answer /v1/models. {tail}"
-                ));
+                WaitOutcome::Ready => return Ok(()),
+                WaitOutcome::Exited(code) => {
+                    let tail = log_tail(Some(&log), 20);
+                    self.slot.clear();
+                    return Err(format!(
+                        "Launched Strata command exited early (code {:?}). {tail}",
+                        code
+                    ));
+                }
+                WaitOutcome::TimedOut => {
+                    let tail = log_tail(Some(&log), 20);
+                    self.slot.clear();
+                    return Err(format!(
+                        "Launched Strata command did not answer /v1/models. {tail}"
+                    ));
+                }
             }
-            return Ok(());
         }
 
         if !self
@@ -132,6 +143,10 @@ impl LlmBackend for Strata {
         cancel: &AtomicBool,
         listener: &mut dyn FnMut(StreamEvent),
     ) {
+        if self.slot.has_child() && !self.slot.alive() {
+            listener(StreamEvent::Error("Launched Strata process is no longer running.".into()));
+            return;
+        }
         let loaded = self.slot.loaded();
         let fallback_model = loaded.as_deref().or_else(|| {
             let configured = self.config.model_id.trim();

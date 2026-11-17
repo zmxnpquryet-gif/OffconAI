@@ -29,6 +29,7 @@ import com.localllm.android.model.ModelRuntimeType
 import com.localllm.android.ui.glass.GButton
 import com.localllm.android.ui.glass.GFilterChip
 import com.localllm.android.ui.glass.GIcon
+import com.localllm.android.ui.glass.GCompactIconButton
 import com.localllm.android.ui.glass.GIconButton
 import com.localllm.android.ui.glass.GIcons
 import com.localllm.android.ui.glass.GText
@@ -238,9 +239,8 @@ internal fun ModelBundleCardItem(
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 if (model.isDownloaded) {
-                    GIconButton(
-                        onClick = onDelete,
-                        modifier = Modifier.size(36.dp)
+                    GCompactIconButton(
+                        onClick = onDelete
                     ) {
                         GIcon(
                             imageVector = GIcons.Delete,

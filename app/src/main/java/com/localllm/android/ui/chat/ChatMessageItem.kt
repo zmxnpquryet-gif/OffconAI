@@ -33,6 +33,7 @@ import com.localllm.android.R
 import com.localllm.android.model.ChatMessage
 import com.localllm.android.model.MessageRole
 import com.localllm.android.ui.glass.GIcon
+import com.localllm.android.ui.glass.GCompactIconButton
 import com.localllm.android.ui.glass.GIconButton
 import com.localllm.android.ui.glass.GIcons
 import com.localllm.android.ui.glass.GText
@@ -229,13 +230,12 @@ fun ChatMessageItem(
                         // Action Icons: Copy, Speak
                         if (!message.isStreaming && displayContent.isNotBlank()) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                GIconButton(
+                                GCompactIconButton(
                                     onClick = {
                                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                                         clipboard.setPrimaryClip(ClipData.newPlainText("AI Response", displayContent))
                                         Toast.makeText(context, copiedText, Toast.LENGTH_SHORT).show()
-                                    },
-                                    modifier = Modifier.size(32.dp)
+                                    }
                                 ) {
                                     GIcon(
                                         imageVector = GIcons.ContentCopy,
@@ -245,9 +245,8 @@ fun ChatMessageItem(
                                     )
                                 }
 
-                                GIconButton(
-                                    onClick = { onSpeak(displayContent) },
-                                    modifier = Modifier.size(32.dp)
+                                GCompactIconButton(
+                                    onClick = { onSpeak(displayContent) }
                                 ) {
                                     GIcon(
                                         imageVector = GIcons.VolumeUp,

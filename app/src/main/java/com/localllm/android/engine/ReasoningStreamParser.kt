@@ -12,8 +12,19 @@
 class ReasoningStreamParser(startInReasoning: Boolean = false) {
 
     companion object {
-        private val OPEN_TAGS = listOf("<think>", "<|channel>thought\n", "<|channel>thought")
-        private val CLOSE_TAGS = listOf("</think>", "<channel|>")
+        private val OPEN_TAGS = listOf(
+            "<think>",
+            "<thought>",
+            "<thinking>",
+            "<|channel>thought\n",
+            "<|channel>thought"
+        )
+        private val CLOSE_TAGS = listOf(
+            "</think>",
+            "</thought>",
+            "</thinking>",
+            "<channel|>"
+        )
         private val TOOL_RESCUE_MARKERS = listOf(
             "<tool_call>",
             "<|tool_call>",

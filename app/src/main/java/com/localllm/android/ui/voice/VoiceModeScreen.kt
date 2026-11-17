@@ -26,9 +26,11 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -39,6 +41,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -52,6 +58,7 @@ import com.localllm.android.ui.glass.GIcon
 import com.localllm.android.ui.glass.GIconButton
 import com.localllm.android.ui.glass.GIcons
 import com.localllm.android.ui.glass.GText
+import com.localllm.android.ui.glass.GTextButton
 import com.localllm.android.ui.glass.GlassTheme
 import com.localllm.android.voice.InteractiveVoiceState
 import com.localllm.android.voice.LocalTtsEngine
@@ -75,11 +82,26 @@ fun VoiceModeScreen(
     val nativeOmniActive by viewModel.nativeOmniActive.collectAsStateWithLifecycle()
     val nativeOmniTranscript by viewModel.nativeOmniTranscript.collectAsStateWithLifecycle()
     val audioDecision by viewModel.voiceAudioDecision.collectAsStateWithLifecycle()
+    val sessionError by viewModel.voiceSessionError.collectAsStateWithLifecycle()
     val isNativeOmni = activeModel?.supportsNativeAudioInput == true &&
         activeModel?.supportsNativeAudioOutput == true
 
     var isMicMuted by remember { mutableStateOf(false) }
     var nativePermissionPending by remember { mutableStateOf(false) }
+    var hasMicPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
+        )
+    }
+
+    // Re-check on entry: the user may have granted the permission in system settings.
+    LaunchedEffect(Unit) {
+        hasMicPermission = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+    }
 
     DisposableEffect(Unit) {
         onDispose {
@@ -89,10 +111,13 @@ fun VoiceModeScreen(
         }
     }
 
+    val uiStatus = VoiceUiStatus.from(voiceState, sessionError)
+
     val micPermissionRequiredMsg = stringResource(R.string.voice_interactive_permission_required)
     val micPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { isGranted ->
+        hasMicPermission = isGranted
         if (isGranted) {
             if (nativePermissionPending) {
                 nativePermissionPending = false
@@ -150,16 +175,26 @@ fun VoiceModeScreen(
     )
 
     val isActiveVoice = voiceState != InteractiveVoiceState.IDLE
-    val dialBackground = if (isActiveVoice) GlassTheme.colors.primary else GlassTheme.colors.surface
-    val dialBorder = if (isActiveVoice) GlassTheme.colors.primary else GlassTheme.colors.outline
-    val dialIconTint = if (isActiveVoice) GlassTheme.colors.onPrimary else GlassTheme.colors.onSurface
-
-    val statusText = when (voiceState) {
-        InteractiveVoiceState.LISTENING -> stringResource(R.string.voice_state_listening)
-        InteractiveVoiceState.PROCESSING -> stringResource(R.string.voice_state_local_thinking)
-        InteractiveVoiceState.SPEAKING -> stringResource(R.string.voice_state_speaking_answer)
-        InteractiveVoiceState.IDLE -> stringResource(R.string.voice_state_idle_hint)
+    val isError = uiStatus == VoiceUiStatus.ERROR
+    val dialBackground = when {
+        isError -> GlassTheme.colors.errorContainer
+        isActiveVoice -> GlassTheme.colors.primary
+        else -> GlassTheme.colors.surface
     }
+    val dialBorder = when {
+        isError -> GlassTheme.colors.error
+        isActiveVoice -> GlassTheme.colors.primary
+        else -> GlassTheme.colors.outline
+    }
+    val dialIconTint = when {
+        isError -> GlassTheme.colors.onErrorContainer
+        isActiveVoice -> GlassTheme.colors.onPrimary
+        else -> GlassTheme.colors.onSurface
+    }
+
+    val statusText = stringResource(VoiceStatusCopy.headlineRes(uiStatus))
+    val statusLabel = stringResource(VoiceStatusCopy.labelRes(uiStatus))
+    val dialAction = stringResource(VoiceStatusCopy.dialActionRes(uiStatus))
 
     Box(
         modifier = modifier
@@ -201,7 +236,10 @@ fun VoiceModeScreen(
 
             GText(
                 text = if (isNativeOmni) {
-                    (activeModel?.name ?: "LFM3 Omni") + " · native audio in → audio out · one tap per turn"
+                    stringResource(
+                        R.string.voice_mode_header_native,
+                        activeModel?.name ?: stringResource(R.string.voice_native_model_fallback)
+                    )
                 } else {
                     stringResource(R.string.voice_native_audio_unavailable)
                 },
@@ -226,6 +264,42 @@ fun VoiceModeScreen(
                 )
             }
 
+            // Permission state is durable: it stays visible until the user grants access,
+            // instead of appearing only as a toast that scrolls away.
+            if (!hasMicPermission) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp, vertical = 6.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(GlassTheme.colors.surface)
+                        .border(1.dp, GlassTheme.colors.outline, RoundedCornerShape(12.dp))
+                        .padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    GIcon(
+                        imageVector = GIcons.MicOff,
+                        contentDescription = null,
+                        tint = GlassTheme.colors.error,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    GText(
+                        text = stringResource(R.string.voice_permission_required),
+                        style = GlassTheme.type.labelSmall,
+                        color = GlassTheme.colors.onSurfaceVariant,
+                        modifier = Modifier.weight(1f)
+                    )
+                    GTextButton(onClick = { micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO) }) {
+                        GText(
+                            text = stringResource(R.string.voice_grant_permission),
+                            color = GlassTheme.colors.primary,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            }
+
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -240,18 +314,49 @@ fun VoiceModeScreen(
                             .clip(CircleShape)
                             .background(dialBackground)
                             .border(1.dp, dialBorder, CircleShape)
-                            .clickable(onClick = ::triggerVoiceAction),
+                            .semantics {
+                                contentDescription = dialAction
+                                stateDescription = statusLabel
+                            }
+                            .clickable(role = Role.Button, onClick = ::triggerVoiceAction),
                         contentAlignment = Alignment.Center
                     ) {
                         GIcon(
-                            imageVector = if (voiceState == InteractiveVoiceState.SPEAKING) GIcons.VolumeUp else GIcons.Mic,
+                            imageVector = when (uiStatus) {
+                                VoiceUiStatus.SPEAKING -> GIcons.VolumeUp
+                                VoiceUiStatus.ERROR -> GIcons.Close
+                                else -> GIcons.Mic
+                            },
                             contentDescription = null,
                             tint = dialIconTint,
                             modifier = Modifier.size(40.dp)
                         )
                     }
 
-                    Spacer(modifier = Modifier.height(24.dp))
+                    Spacer(modifier = Modifier.height(20.dp))
+
+                    // Mono state label: one glance tells idle/listening/thinking/speaking/error apart.
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(4.dp)
+                                .clip(RoundedCornerShape(1.dp))
+                                .background(
+                                    if (isError) GlassTheme.colors.error
+                                    else if (isActiveVoice) GlassTheme.colors.primary
+                                    else GlassTheme.colors.onSurfaceVariant
+                                )
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        GText(
+                            text = statusLabel,
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = if (isError) GlassTheme.colors.error else GlassTheme.colors.onSurfaceVariant
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
 
                     GText(
                         text = statusText,
@@ -260,7 +365,7 @@ fun VoiceModeScreen(
                     )
 
                     val liveTranscript = if (isNativeOmni) nativeOmniTranscript else recognizedText
-                    if (liveTranscript.isNotBlank()) {
+                    if (liveTranscript.isNotBlank() && !isError) {
                         Spacer(modifier = Modifier.height(8.dp))
                         GText(
                             text = "\"$liveTranscript\"",
@@ -279,19 +384,47 @@ fun VoiceModeScreen(
                     .verticalScroll(rememberScrollState())
                     .padding(bottom = 12.dp)
             ) {
-                if (isNativeOmni) {
+                if (isError) {
+                    // Explicit, dismissible error state with the real reason from the loop.
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp, vertical = 6.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(GlassTheme.colors.surface)
+                            .border(1.dp, GlassTheme.colors.errorContainer, RoundedCornerShape(12.dp))
+                            .padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        GText(
+                            text = sessionError.orEmpty(),
+                            style = GlassTheme.type.labelSmall,
+                            color = GlassTheme.colors.onSurface,
+                            modifier = Modifier.weight(1f)
+                        )
+                        GTextButton(onClick = { viewModel.clearVoiceSessionError() }) {
+                            GText(
+                                text = stringResource(R.string.voice_error_dismiss),
+                                color = GlassTheme.colors.onSurfaceVariant,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+                }
+
+                if (isNativeOmni && !isError) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 20.dp, vertical = 6.dp)
                     ) {
                         GText(
-                            text = "Native Omni session",
+                            text = stringResource(R.string.voice_native_session_title),
                             style = GlassTheme.type.labelSmall,
                             color = GlassTheme.colors.primary
                         )
                         GText(
-                            text = "16 kHz PCM is fed directly to the model; text and 24 kHz speech arrive together.",
+                            text = stringResource(R.string.voice_native_session_desc),
                             fontSize = 11.sp,
                             color = GlassTheme.colors.onSurfaceVariant
                         )
@@ -304,7 +437,7 @@ fun VoiceModeScreen(
                             )
                         }
                     }
-                } else {
+                } else if (!isError) {
                     GText(
                         text = stringResource(R.string.voice_tts_section),
                         style = GlassTheme.type.labelSmall,
@@ -373,6 +506,9 @@ fun VoiceModeScreen(
                     horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    val micToggleLabel = stringResource(
+                        if (isMicMuted) R.string.voice_mic_unmute else R.string.voice_mic_mute
+                    )
                     GIconButton(
                         onClick = {
                             isMicMuted = !isMicMuted
@@ -386,10 +522,11 @@ fun VoiceModeScreen(
                             .clip(CircleShape)
                             .background(GlassTheme.colors.surface)
                             .border(1.dp, GlassTheme.colors.outline, CircleShape)
+                            .semantics { contentDescription = micToggleLabel }
                     ) {
                         GIcon(
                             imageVector = if (isMicMuted) GIcons.MicOff else GIcons.Mic,
-                            contentDescription = stringResource(R.string.voice_mic_desc),
+                            contentDescription = null,
                             tint = if (isMicMuted) GlassTheme.colors.error else GlassTheme.colors.onSurface
                         )
                     }

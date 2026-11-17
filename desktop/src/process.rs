@@ -53,6 +53,22 @@ impl ProcessSlot {
         stop_child(child);
         *self.started_at.lock().expect("started lock") = None;
         *self.loaded_model.lock().expect("model lock") = None;
+        *self.log_file.lock().expect("log lock") = None;
+    }
+
+    pub fn has_child(&self) -> bool {
+        self.child.lock().expect("process lock").is_some()
+    }
+
+    pub fn exit_code(&self) -> Option<Option<i32>> {
+        let mut guard = self.child.lock().expect("process lock");
+        match guard.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(Some(status)) => Some(status.code()),
+                _ => None,
+            },
+            None => None,
+        }
     }
 
     pub fn alive(&self) -> bool {
@@ -214,12 +230,25 @@ pub fn spawn_with_log(mut command: Command, path: &Path) -> Result<Child, String
 }
 
 pub fn log_tail(path: Option<&Path>, lines: usize) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    const MAX_TAIL_BYTES: u64 = 256 * 1024;
     let Some(path) = path else {
         return String::new();
     };
-    let Ok(text) = fs::read_to_string(path) else {
+    let Ok(mut file) = File::open(path) else {
         return String::new();
     };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return String::new();
+    };
+    if len > MAX_TAIL_BYTES {
+        let _ = file.seek(SeekFrom::End(-(MAX_TAIL_BYTES as i64)));
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
     let all: Vec<&str> = text.lines().collect();
     if all.is_empty() {
         return String::new();
@@ -228,15 +257,45 @@ pub fn log_tail(path: Option<&Path>, lines: usize) -> String {
     format!("Log tail: {}", all[from..].join(" | "))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitOutcome {
+    Ready,
+    Exited(Option<i32>),
+    TimedOut,
+}
+
 pub fn wait_for(timeout: Duration, mut probe: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if probe() {
             return true;
         }
-        thread::sleep(Duration::from_millis(400));
+        thread::sleep(Duration::from_millis(150));
     }
     false
+}
+
+/// Polls until `probe()` succeeds, the managed child exits prematurely, or `timeout` elapses.
+pub fn wait_for_process_health(
+    slot: &ProcessSlot,
+    timeout: Duration,
+    mut probe: impl FnMut() -> bool,
+) -> WaitOutcome {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(code) = slot.exit_code() {
+            return WaitOutcome::Exited(code);
+        }
+        if probe() {
+            return WaitOutcome::Ready;
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    if let Some(code) = slot.exit_code() {
+        WaitOutcome::Exited(code)
+    } else {
+        WaitOutcome::TimedOut
+    }
 }
 
 pub fn default_threads() -> usize {
@@ -337,8 +396,20 @@ pub fn parse_command(input: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
-    for character in input.chars() {
+    let mut chars = input.chars().peekable();
+    while let Some(character) = chars.next() {
         match quote {
+            Some(active) if character == '\\' => {
+                if let Some(&next) = chars.peek() {
+                    if next == active || next == '\\' {
+                        current.push(chars.next().unwrap());
+                    } else {
+                        current.push(character);
+                    }
+                } else {
+                    current.push(character);
+                }
+            }
             Some(active) if character == active => quote = None,
             Some(_) => current.push(character),
             None if character == '"' || character == '\'' => quote = Some(character),

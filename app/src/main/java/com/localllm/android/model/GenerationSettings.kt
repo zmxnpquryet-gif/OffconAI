@@ -45,11 +45,7 @@ data class GenerationSettings(
     val isApiExternalAccessEnabled: Boolean
         get() = apiServerBindAddress == "0.0.0.0"
 
+    /** Localized tier label; thresholds live in [ReasoningEffortTier] so the composer agrees. */
     val reasoningEffortLabel: String
-        get() = when {
-            reasoningEffort <= 0.25f -> AppStrings.get(R.string.gen_effort_low)
-            reasoningEffort <= 0.6f -> AppStrings.get(R.string.gen_effort_medium)
-            reasoningEffort <= 0.85f -> AppStrings.get(R.string.gen_effort_high)
-            else -> AppStrings.get(R.string.gen_effort_max)
-        }
+        get() = AppStrings.get(ReasoningEffortTier.of(reasoningEffort).labelRes)
 }

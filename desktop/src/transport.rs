@@ -6,9 +6,17 @@ use crate::contracts::{ChatRequest, StreamEvent, ToolCallRecord};
 use reqwest::blocking::{Client, Response};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+const MAX_SSE_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_NON_STREAM_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+const MAX_ERROR_CHARS: usize = 500;
+const MAX_TOOL_CALLS: usize = 16;
+const MAX_TOOL_ARG_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct OpenAiTransport {
     client: Client,
@@ -58,14 +66,22 @@ impl OpenAiTransport {
         };
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().unwrap_or_default();
+            let body = read_bounded_text(response, MAX_ERROR_BODY_BYTES)
+                .map(|text| truncate_chars(&text, MAX_ERROR_CHARS))
+                .unwrap_or_default();
             listener(StreamEvent::Error(format!("HTTP {status}: {body}")));
             return;
         }
         if request.stream {
             read_stream(response, cancel, listener);
         } else {
-            let body = response.text().unwrap_or_default();
+            let body = match read_bounded_text(response, MAX_NON_STREAM_BYTES) {
+                Ok(text) => text,
+                Err(error) => {
+                    listener(StreamEvent::Error(error));
+                    return;
+                }
+            };
             let mut assembler = ToolCallAssembler::default();
             let errored = parse_payload(&body, &mut assembler, listener);
             assembler.flush(listener);
@@ -163,7 +179,35 @@ pub fn models_url(base_url: &str) -> String {
 }
 
 pub fn health_url(base_url: &str) -> String {
-    format!("{}/health", strip_slash(base_url))
+    let base = strip_slash(base_url);
+    let base = base
+        .strip_suffix("/chat/completions")
+        .unwrap_or(&base);
+    let base = base.strip_suffix("/v1").unwrap_or(base);
+    format!("{base}/health")
+}
+
+fn read_bounded_text(response: Response, limit: usize) -> Result<String, String> {
+    let mut buf = Vec::new();
+    let read_limit = (limit as u64).saturating_add(1);
+    response
+        .take(read_limit)
+        .read_to_end(&mut buf)
+        .map_err(|error| format!("failed to read response body: {error}"))?;
+    if buf.len() > limit {
+        return Err(format!("response exceeded {limit} byte limit"));
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut iter = text.chars();
+    let prefix: String = iter.by_ref().take(max_chars).collect();
+    if iter.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
+    }
 }
 
 fn strip_slash(value: &str) -> String {
@@ -182,16 +226,27 @@ struct PartialToolCall {
 #[derive(Default)]
 struct ToolCallAssembler {
     slots: BTreeMap<usize, PartialToolCall>,
+    total_arg_bytes: usize,
 }
 
 impl ToolCallAssembler {
-    fn ingest(&mut self, calls: &[Value]) {
+    fn ingest(&mut self, calls: &[Value]) -> Result<(), String> {
         for (fallback_idx, item) in calls.iter().enumerate() {
-            let index = item
-                .get("index")
-                .and_then(Value::as_u64)
-                .map(|idx| idx as usize)
-                .unwrap_or(fallback_idx);
+            let index = match item.get("index") {
+                Some(val) => {
+                    let Some(idx) = val.as_u64() else {
+                        return Err("malformed tool_calls index".into());
+                    };
+                    if idx >= MAX_TOOL_CALLS as u64 {
+                        return Err(format!("tool call index {idx} exceeds limit"));
+                    }
+                    idx as usize
+                }
+                None => fallback_idx,
+            };
+            if !self.slots.contains_key(&index) && self.slots.len() >= MAX_TOOL_CALLS {
+                return Err(format!("too many tool calls in turn (>{MAX_TOOL_CALLS})"));
+            }
             let slot = self.slots.entry(index).or_default();
             if let Some(id) = item
                 .get("id")
@@ -213,13 +268,19 @@ impl ToolCallAssembler {
                     .and_then(Value::as_str)
                     .filter(|args| !args.is_empty())
                 {
+                    if self.total_arg_bytes.saturating_add(args.len()) > MAX_TOOL_ARG_BYTES {
+                        return Err("tool call arguments exceeded size limit".into());
+                    }
+                    self.total_arg_bytes += args.len();
                     slot.arguments.push_str(args);
                 }
             }
         }
+        Ok(())
     }
 
     fn flush(&mut self, listener: &mut dyn FnMut(StreamEvent)) {
+        self.total_arg_bytes = 0;
         for (_, partial) in std::mem::take(&mut self.slots) {
             let name = if partial.name.trim().is_empty() {
                 "tool".to_string()
@@ -239,13 +300,26 @@ fn read_stream(response: Response, cancel: &AtomicBool, listener: &mut dyn FnMut
     let mut reader = BufReader::new(response);
     let mut assembler = ToolCallAssembler::default();
     let mut line = String::new();
+    let mut event_data = Vec::<String>::new();
+    let mut event_bytes = 0usize;
+
     loop {
         if cancel.load(Ordering::SeqCst) {
             break;
         }
         line.clear();
-        match reader.read_line(&mut line) {
+        let read_res = reader
+            .by_ref()
+            .take((MAX_SSE_LINE_BYTES + 1) as u64)
+            .read_line(&mut line);
+        match read_res {
             Ok(0) => break,
+            Ok(n) if n > MAX_SSE_LINE_BYTES => {
+                listener(StreamEvent::Error(
+                    "SSE line exceeded 4 MiB limit".to_string(),
+                ));
+                return;
+            }
             Ok(_) => {}
             Err(error) => {
                 if !cancel.load(Ordering::Relaxed) {
@@ -256,20 +330,57 @@ fn read_stream(response: Response, cancel: &AtomicBool, listener: &mut dyn FnMut
                 return;
             }
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with(':') {
+
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            if !event_data.is_empty() {
+                let payload = event_data.join("\n");
+                event_data.clear();
+                event_bytes = 0;
+                if payload.trim() == "[DONE]" {
+                    assembler.flush(listener);
+                    listener(StreamEvent::Done);
+                    return;
+                }
+                if parse_payload(&payload, &mut assembler, listener) {
+                    return;
+                }
+            }
             continue;
         }
-        let payload = trimmed.strip_prefix("data:").unwrap_or(trimmed).trim();
-        if payload == "[DONE]" {
-            assembler.flush(listener);
-            listener(StreamEvent::Done);
-            return;
+        if trimmed.starts_with(':') {
+            continue;
         }
-        if parse_payload(payload, &mut assembler, listener) {
+        if let Some(rest) = trimmed.strip_prefix("data:") {
+            let data_part = rest.strip_prefix(' ').unwrap_or(rest);
+            event_bytes = event_bytes.saturating_add(data_part.len() + 1);
+            if event_bytes > MAX_SSE_EVENT_BYTES {
+                listener(StreamEvent::Error(
+                    "SSE event exceeded 4 MiB limit".to_string(),
+                ));
+                return;
+            }
+            event_data.push(data_part.to_string());
+        } else if trimmed.starts_with("event:")
+            || trimmed.starts_with("id:")
+            || trimmed.starts_with("retry:")
+        {
+            continue;
+        } else if trimmed.starts_with('{') {
+            // Fallback for servers that stream raw NDJSON lines without SSE framing.
+            if parse_payload(trimmed, &mut assembler, listener) {
+                return;
+            }
+        }
+    }
+
+    if !cancel.load(Ordering::SeqCst) && !event_data.is_empty() {
+        let payload = event_data.join("\n");
+        if payload.trim() != "[DONE]" && parse_payload(&payload, &mut assembler, listener) {
             return;
         }
     }
+
     assembler.flush(listener);
     listener(StreamEvent::Done);
 }
@@ -287,7 +398,7 @@ fn parse_payload(
         return false;
     };
     if let Some(error) = value.get("error").and_then(error_text) {
-        listener(StreamEvent::Error(error));
+        listener(StreamEvent::Error(truncate_chars(&error, MAX_ERROR_CHARS)));
         return true;
     }
     let delta = value
@@ -305,7 +416,10 @@ fn parse_payload(
         .and_then(|d| d.get("tool_calls"))
         .and_then(Value::as_array)
     {
-        assembler.ingest(tool_calls);
+        if let Err(err) = assembler.ingest(tool_calls) {
+            listener(StreamEvent::Error(err));
+            return true;
+        }
     }
 
     let text = delta
@@ -318,6 +432,8 @@ fn parse_payload(
             delta
                 .get("reasoning_content")
                 .or_else(|| delta.get("reasoning"))
+                .or_else(|| delta.get("thought"))
+                .or_else(|| delta.get("thinking"))
         })
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
@@ -430,6 +546,52 @@ mod tests {
             health_url("http://127.0.0.1:8080/"),
             "http://127.0.0.1:8080/health"
         );
+        assert_eq!(
+            health_url("http://127.0.0.1:8080/v1"),
+            "http://127.0.0.1:8080/health"
+        );
+        assert_eq!(
+            health_url("http://127.0.0.1:8080/v1/chat/completions"),
+            "http://127.0.0.1:8080/health"
+        );
+    }
+
+    #[test]
+    fn multiline_sse_event_and_control_fields_parse_cleanly() {
+        let server = test_support::serve_once(
+            ": keepalive\n\n\
+             event: message\n\
+             id: 1\n\
+             retry: 3000\n\
+             data: {\"choices\":[{\"delta\":\n\
+             data: {\"thought\":\"plan \",\"content\":\"hi\"}}]}\n\n\
+             data: [DONE]\n\n",
+            "text/event-stream",
+        );
+        let transport = OpenAiTransport::new();
+        let cancel = AtomicBool::new(false);
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut errored = false;
+        let request = ChatRequest::text(vec![ChatMessage::new("user", "hi")]);
+        transport.chat(&server.base_url, None, &request, &cancel, &mut |event| match event {
+            StreamEvent::Delta {
+                text: t,
+                reasoning: r,
+            } => {
+                if let Some(chunk) = t {
+                    text.push_str(&chunk);
+                }
+                if let Some(chunk) = r {
+                    reasoning.push_str(&chunk);
+                }
+            }
+            StreamEvent::Error(_) => errored = true,
+            _ => {}
+        });
+        assert!(!errored);
+        assert_eq!(reasoning, "plan ");
+        assert_eq!(text, "hi");
     }
 
     #[test]

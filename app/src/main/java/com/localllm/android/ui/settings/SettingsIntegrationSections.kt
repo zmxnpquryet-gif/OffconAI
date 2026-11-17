@@ -25,6 +25,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
@@ -352,31 +357,46 @@ internal fun ThemeAndLanguageSections(
         ) {
             themes.forEach { (key, name, color) ->
                 val isSelected = settings.themeColorName == key
+                val swatchLabel = stringResource(R.string.settings_theme_swatch_desc, name)
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.clickable {
-                        onUpdateSettings(settings.copy(themeColorName = key))
-                    }
                 ) {
+                    // The swatch is a color-only control: without a name and a selected
+                    // state TalkBack announced nothing useful, and the 40dp dot was below
+                    // the 48dp touch minimum.
                     Box(
                         modifier = Modifier
-                            .size(40.dp)
-                            .clip(CircleShape)
-                            .background(color)
-                            .border(
-                                width = if (isSelected) 2.dp else 1.dp,
-                                color = if (isSelected) GlassTheme.colors.onSurface else GlassTheme.colors.outline,
-                                shape = CircleShape
-                            ),
+                            .size(48.dp)
+                            .semantics {
+                                contentDescription = swatchLabel
+                                role = Role.RadioButton
+                                selected = isSelected
+                            }
+                            .clickable(role = Role.RadioButton) {
+                                onUpdateSettings(settings.copy(themeColorName = key))
+                            },
                         contentAlignment = Alignment.Center
                     ) {
-                        if (isSelected) {
-                            GIcon(
-                                imageVector = GIcons.Check,
-                                contentDescription = null,
-                                tint = Color.Black,
-                                modifier = Modifier.size(18.dp)
-                            )
+                        Box(
+                            modifier = Modifier
+                                .size(40.dp)
+                                .clip(CircleShape)
+                                .background(color)
+                                .border(
+                                    width = if (isSelected) 2.dp else 1.dp,
+                                    color = if (isSelected) GlassTheme.colors.onSurface else GlassTheme.colors.outline,
+                                    shape = CircleShape
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (isSelected) {
+                                GIcon(
+                                    imageVector = GIcons.Check,
+                                    contentDescription = null,
+                                    tint = Color.Black,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
                         }
                     }
                     Spacer(modifier = Modifier.height(4.dp))
@@ -473,10 +493,12 @@ internal fun DocumentsAndApiSections(
                     color = if (isApiModeEnabled) GlassTheme.colors.primary else GlassTheme.colors.onSurface
                 )
                 GText(
+                    // "Waiting for requests on port 11434" was shown while the server was
+                    // switched off, which reads as "a server is running".
                     text = if (isApiModeEnabled) {
                         if (settings.isApiExternalAccessEnabled) stringResource(R.string.settings_api_url_external, localIpAddress, apiPort)
                         else stringResource(R.string.settings_api_url_local, apiPort)
-                    } else stringResource(R.string.settings_api_waiting),
+                    } else stringResource(R.string.settings_api_server_off_hint),
                     style = GlassTheme.type.labelSmall,
                     color = GlassTheme.colors.onSurfaceVariant
                 )

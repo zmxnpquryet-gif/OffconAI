@@ -68,18 +68,44 @@ pub fn load_settings() -> Settings {
     }
 }
 
-/// Write via a temp file + rename so a crash can never truncate settings.
+/// Strip embedded `user:pass@` credentials from persisted endpoint URLs so
+/// secrets never sit in cleartext on disk.
+pub fn redact_url_credentials(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let Ok(mut parsed) = reqwest::Url::parse(trimmed) else {
+        return raw.to_string();
+    };
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        let _ = parsed.set_username("");
+        let _ = parsed.set_password(None);
+        return parsed.to_string().trim_end_matches('/').to_string();
+    }
+    raw.to_string()
+}
+
+/// Write via a temp file + `sync_all` + rename so a crash can never truncate settings.
 pub fn save_settings(settings: &Settings) -> Result<(), String> {
+    use std::io::Write as _;
     let path = settings_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     }
-    let body = serde_json::to_string_pretty(settings)
+    let mut sanitized = settings.clone();
+    sanitized.vllm_endpoint = redact_url_credentials(&sanitized.vllm_endpoint);
+    sanitized.strata_endpoint = redact_url_credentials(&sanitized.strata_endpoint);
+    sanitized.mcp_url = redact_url_credentials(&sanitized.mcp_url);
+    sanitized.image_endpoint = redact_url_credentials(&sanitized.image_endpoint);
+
+    let body = serde_json::to_string_pretty(&sanitized)
         .map_err(|error| format!("settings serialization failed: {error}"))?;
     let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, body)
+    let mut file = std::fs::File::create(&temp)
+        .map_err(|error| format!("could not create {}: {error}", temp.display()))?;
+    file.write_all(body.as_bytes())
+        .and_then(|_| file.sync_all())
         .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
+    drop(file);
     std::fs::rename(&temp, &path)
         .map_err(|error| format!("could not finalize {}: {error}", path.display()))
 }
@@ -128,5 +154,17 @@ mod tests {
         let parsed: Settings = serde_json::from_str(with_bom.trim_start_matches('\u{FEFF}'))
             .expect("bom-stripped parse");
         assert_eq!(parsed.backend_index, 1);
+    }
+
+    #[test]
+    fn redacts_embedded_credentials_in_urls() {
+        assert_eq!(
+            redact_url_credentials("https://alice:secret@gw.example.com:9000/v1"),
+            "https://gw.example.com:9000/v1"
+        );
+        assert_eq!(
+            redact_url_credentials("http://127.0.0.1:8000"),
+            "http://127.0.0.1:8000"
+        );
     }
 }

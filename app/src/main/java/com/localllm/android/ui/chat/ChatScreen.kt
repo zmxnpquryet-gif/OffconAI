@@ -29,10 +29,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -46,6 +48,7 @@ import com.localllm.android.ui.glass.GDrawer
 import com.localllm.android.ui.glass.GScaffold
 import com.localllm.android.ui.glass.GlassTheme
 import com.localllm.android.voice.InteractiveVoiceState
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 
 @Composable
@@ -83,47 +86,83 @@ fun ChatScreen(
     var showStatusDetailDialog by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
 
-    var autoScrollEnabled by remember { mutableStateOf(true) }
-    val isScrolledToBottom by remember {
+    // Follow state: a plain policy object drives the decision, a Compose state mirrors it
+    // so the "follow answer" button can appear/disappear without recomposing per chunk.
+    val followState = remember { ChatFollowState() }
+    var following by remember { mutableStateOf(true) }
+    fun dispatchScrollEvent(event: ChatScrollEvent): Boolean {
+        val shouldScroll = followState.onEvent(event)
+        following = followState.isFollowing
+        return shouldScroll
+    }
+
+    val density = LocalDensity.current
+    val bottomTolerancePx = remember(density) { with(density) { 12.dp.roundToPx() } }
+
+    val isScrolledToBottom by remember(bottomTolerancePx) {
         derivedStateOf {
-            val layoutInfo = listState.layoutInfo
-            val visibleItems = layoutInfo.visibleItemsInfo
-            if (visibleItems.isEmpty()) return@derivedStateOf true
-            val lastVisible = visibleItems.last()
-            val totalCount = layoutInfo.totalItemsCount
-            val isLastItem = lastVisible.index >= totalCount - 1
-            val isBottomReached = (lastVisible.offset + lastVisible.size) <= (layoutInfo.viewportEndOffset + 100)
-            isLastItem && isBottomReached
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()
+            ChatScrollPolicy.isAtBottom(
+                lastVisibleIndex = last?.index ?: -1,
+                lastVisibleEndOffset = (last?.offset ?: 0) + (last?.size ?: 0),
+                totalItems = info.totalItemsCount,
+                viewportEndOffset = info.viewportEndOffset,
+                tolerancePx = bottomTolerancePx
+            )
         }
     }
 
+    suspend fun scrollTranscriptToEnd() {
+        val totalCount = listState.layoutInfo.totalItemsCount
+        if (totalCount > 0) listState.scrollToItem(totalCount - 1)
+    }
+
+    // Touch intent wins immediately: a drag start stops following even while content is
+    // still streaming below the finger.
     LaunchedEffect(listState) {
         listState.interactionSource.interactions.collect { interaction ->
             when (interaction) {
-                is DragInteraction.Start -> autoScrollEnabled = false
-                is DragInteraction.Stop, is DragInteraction.Cancel -> autoScrollEnabled = isScrolledToBottom
+                is DragInteraction.Start -> dispatchScrollEvent(ChatScrollEvent.USER_DRAG_STARTED)
+                is DragInteraction.Stop, is DragInteraction.Cancel -> dispatchScrollEvent(
+                    if (isScrolledToBottom) ChatScrollEvent.USER_DRAG_ENDED_AT_BOTTOM
+                    else ChatScrollEvent.USER_DRAG_ENDED_ABOVE_BOTTOM
+                )
             }
         }
     }
 
-    LaunchedEffect(isScrolledToBottom) {
-        if (isScrolledToBottom) autoScrollEnabled = true
+    // A scroll that settled at the end re-enables following (a fling back down). Scrolls
+    // still in progress are ignored, so a drag can never be re-pinned halfway through.
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress to isScrolledToBottom }
+            .distinctUntilChanged()
+            .collect { (inProgress, atBottom) ->
+                if (!inProgress && atBottom) dispatchScrollEvent(ChatScrollEvent.SETTLED_AT_BOTTOM)
+            }
     }
 
-    LaunchedEffect(streamingMessage?.content?.length, autoScrollEnabled) {
-        if (streamingMessage != null && autoScrollEnabled) {
-            val totalCount = listState.layoutInfo.totalItemsCount
-            if (totalCount > 0) listState.scrollToItem(totalCount - 1)
+    LaunchedEffect(streamingMessage?.content?.length) {
+        if (streamingMessage != null && dispatchScrollEvent(ChatScrollEvent.STREAMING_UPDATE)) {
+            scrollTranscriptToEnd()
         }
     }
 
-    LaunchedEffect(messages.size) {
+    // A new user turn always re-pins the transcript, including prompts sent from the
+    // empty state (which bypass the composer's send button).
+    LaunchedEffect(messages.lastOrNull()?.id) {
         if (messages.isNotEmpty() && messages.last().role == MessageRole.USER) {
-            autoScrollEnabled = true
-            val totalCount = listState.layoutInfo.totalItemsCount
-            if (totalCount > 0) listState.scrollToItem(totalCount - 1)
+            dispatchScrollEvent(ChatScrollEvent.PROMPT_SUBMITTED)
+            scrollTranscriptToEnd()
         }
     }
+
+    // A turn that carries an image can spend a long time before the first token: say so
+    // instead of showing a generic "generating" line.
+    val pendingImageTurn = remember(messages) {
+        messages.lastOrNull { it.role == MessageRole.USER }?.attachment?.isImage == true
+    }
+    val isPreparingImage = isGenerating && pendingImageTurn && streamingMessage?.content.isNullOrBlank()
 
     val micPermissionDeniedMsg = stringResource(R.string.chat_voice_mic_permission_required)
     val micPermissionLauncher = rememberLauncherForActivityResult(
@@ -204,12 +243,9 @@ fun ChatScreen(
                             onSendMessage = {
                                 val text = inputText
                                 inputText = ""
-                                autoScrollEnabled = true
+                                dispatchScrollEvent(ChatScrollEvent.PROMPT_SUBMITTED)
                                 viewModel.sendMessage(text)
-                                scope.launch {
-                                    val totalCount = listState.layoutInfo.totalItemsCount
-                                    if (totalCount > 0) listState.scrollToItem(totalCount - 1)
-                                }
+                                scope.launch { scrollTranscriptToEnd() }
                             },
                             onStopGeneration = viewModel::stopGeneration,
                             isGenerating = isGenerating,
@@ -247,7 +283,8 @@ fun ChatScreen(
                             modelLoadingStage = modelLoadingStage,
                             currentTps = streamingMessage?.tps ?: 0f,
                             promptSpeed = streamingMessage?.promptSpeed ?: 0f,
-                            contextTokens = contextUsageTokens
+                            contextTokens = contextUsageTokens,
+                            isPreparingImage = isPreparingImage
                         )
                     }
                 }
@@ -358,7 +395,7 @@ fun ChatScreen(
                             }
                         }
 
-                        val jumpVisible = !autoScrollEnabled && (streamingMessage != null || isGenerating)
+                        val jumpVisible = !following && (streamingMessage != null || isGenerating)
                         val jumpAlpha by animateFloatAsState(
                             targetValue = if (jumpVisible) 1f else 0f,
                             label = "jumpAlpha"
@@ -372,11 +409,8 @@ fun ChatScreen(
                             ) {
                                 JumpToLatestButton(
                                     onClick = {
-                                        autoScrollEnabled = true
-                                        scope.launch {
-                                            val totalCount = listState.layoutInfo.totalItemsCount
-                                            if (totalCount > 0) listState.scrollToItem(totalCount - 1)
-                                        }
+                                        dispatchScrollEvent(ChatScrollEvent.JUMP_TO_LATEST)
+                                        scope.launch { scrollTranscriptToEnd() }
                                     }
                                 )
                             }

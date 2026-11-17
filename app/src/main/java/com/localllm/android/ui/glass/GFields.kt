@@ -25,6 +25,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 
@@ -95,11 +96,17 @@ fun GTextField(
     }
 }
 
-/** Minimal clickable row used for bottom-sheet attachment options. */
+/**
+ * Minimal clickable row used for bottom-sheet attachment options.
+ *
+ * [enabled] is false while a system picker is opening, so a second tap cannot start a
+ * second picker; the row dims instead of silently ignoring the tap.
+ */
 @Composable
 fun GOptionRow(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
     content: @Composable () -> Unit
 ) {
     Row(
@@ -107,7 +114,8 @@ fun GOptionRow(
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(GlassTheme.colors.surfaceVariant.copy(alpha = 0.55f))
-            .clickable(onClick = onClick)
+            .alpha(if (enabled) 1f else 0.5f)
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
             .padding(16.dp),
         verticalAlignment = Alignment.CenterVertically,
         content = { content() }

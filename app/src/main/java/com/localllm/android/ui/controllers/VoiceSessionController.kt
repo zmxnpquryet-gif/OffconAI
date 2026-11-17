@@ -64,6 +64,18 @@ internal class VoiceSessionController(
     private val _nativeOmniTranscript = MutableStateFlow("")
     val nativeOmniTranscript: StateFlow<String> = _nativeOmniTranscript.asStateFlow()
 
+    /**
+     * Last failure that stopped a voice turn. The interactive loop used to drop the
+     * message from `startListening(onError = { _ -> ... })`, so a denied microphone or a
+     * failed AudioRecord silently returned the screen to idle. The screen now shows this.
+     */
+    private val _lastError = MutableStateFlow<String?>(null)
+    val lastError: StateFlow<String?> = _lastError.asStateFlow()
+
+    fun clearError() {
+        _lastError.value = null
+    }
+
     fun downloadLocalStt() {
         scope.launch { voiceManager.localStt.downloadModel() }
     }
@@ -243,10 +255,12 @@ internal class VoiceSessionController(
         val current = activeModel()
         if (current == null || !current.isDownloaded) {
             val noModelMsg = strings.get(R.string.vm_voice_no_model)
+            _lastError.value = noModelMsg
             postStatus(noModelMsg)
             voiceManager.speak(noModelMsg)
             return
         }
+        _lastError.value = null
         voiceManager.startListening(
             onResult = { userSpokenText ->
                 if (userSpokenText.isBlank() || userSpokenText == lastVoiceInput) {
@@ -327,7 +341,11 @@ internal class VoiceSessionController(
                     }
                 }
             },
-            onError = { _ -> voiceManager.setVoiceState(InteractiveVoiceState.IDLE) },
+            onError = { message ->
+                // Keep the reason on screen instead of silently dropping back to idle.
+                _lastError.value = message.ifBlank { strings.get(R.string.vm_voice_error) }
+                voiceManager.setVoiceState(InteractiveVoiceState.IDLE)
+            },
             autoEndpoint = true
         )
     }
@@ -340,6 +358,7 @@ internal class VoiceSessionController(
         nativeOmniJob?.cancel()
         nativeOmniJob = null
         _nativeOmniActive.value = false
+        _lastError.value = null
         runCatching { voiceManager.stopListening() }
         runCatching { voiceManager.stopSpeaking() }
     }

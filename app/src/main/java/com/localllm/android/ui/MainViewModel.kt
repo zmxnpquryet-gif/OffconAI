@@ -241,6 +241,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     val nativeOmniActive: StateFlow<Boolean> get() = voiceController.nativeOmniActive
     val nativeOmniTranscript: StateFlow<String> get() = voiceController.nativeOmniTranscript
+    val voiceSessionError: StateFlow<String?> get() = voiceController.lastError
 
     val isApiModeEnabled: StateFlow<Boolean> get() = apiController.isApiModeEnabled
     val apiServerPort: StateFlow<Int> get() = apiController.apiServerPort
@@ -414,6 +415,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun stopNativeOmniTurn() = voiceController.stopNativeOmniTurn()
     fun stopNativeOmniSession() = voiceController.stopNativeOmniSession()
     fun startInteractiveVoiceSession() = voiceController.startInteractiveVoiceSession()
+    fun clearVoiceSessionError() = voiceController.clearError()
 
     // ---- API Server actions ----
     fun setApiModeEnabled(enabled: Boolean) = apiController.setApiModeEnabled(enabled)

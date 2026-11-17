@@ -4,7 +4,9 @@ use crate::contracts::{
     BackendCapabilities, BackendKind, ChatRequest, LlmBackend, ModelSpec, ResourceSnapshot,
     StreamEvent,
 };
-use crate::process::{log_path, log_tail, spawn_with_log, wait_for, ProcessSlot};
+use crate::process::{
+    log_path, log_tail, spawn_with_log, wait_for_process_health, ProcessSlot, WaitOutcome,
+};
 use crate::transport::OpenAiTransport;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,6 +80,7 @@ impl LlmBackend for Vllm {
     }
 
     fn load(&self, model: &ModelSpec) -> Result<(), String> {
+        self.unload();
         let served = {
             let explicit = model.effective_served_id();
             if explicit != "local-model" || self.config.model_path.trim().is_empty() {
@@ -126,15 +129,21 @@ impl LlmBackend for Vllm {
             let child = spawn_with_log(command, &log)?;
             self.slot.store_child(child, log.clone());
             self.slot.set_loaded(&served);
-            if !wait_for(Duration::from_secs(300), || {
-                self.slot.alive()
-                    && self
-                        .transport
-                        .models_available(&self.config.base_url, self.config.api_key.as_deref())
+            match wait_for_process_health(&self.slot, Duration::from_secs(300), || {
+                self.transport
+                    .models_available(&self.config.base_url, self.config.api_key.as_deref())
             }) {
-                let tail = log_tail(Some(&log), 20);
-                self.slot.clear();
-                return Err(format!("vLLM did not become ready. {tail}"));
+                WaitOutcome::Ready => {}
+                WaitOutcome::Exited(code) => {
+                    let tail = log_tail(Some(&log), 20);
+                    self.slot.clear();
+                    return Err(format!("vLLM exited early (code {:?}). {tail}", code));
+                }
+                WaitOutcome::TimedOut => {
+                    let tail = log_tail(Some(&log), 20);
+                    self.slot.clear();
+                    return Err(format!("vLLM did not become ready. {tail}"));
+                }
             }
         } else {
             if !self
@@ -161,6 +170,10 @@ impl LlmBackend for Vllm {
         cancel: &AtomicBool,
         listener: &mut dyn FnMut(StreamEvent),
     ) {
+        if self.slot.has_child() && !self.slot.alive() {
+            listener(StreamEvent::Error("Managed vLLM process is no longer running.".into()));
+            return;
+        }
         let loaded = self.slot.loaded();
         let fallback_model = loaded.as_deref().or_else(|| {
             let configured = self.config.model_id.trim();

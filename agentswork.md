@@ -654,3 +654,43 @@
   - **E2E 채팅 검증**: settings.json(카탈로그 키 0.6B) 시드 → 앱 기동 → 자동 복원으로 번들 `llama-server` 기동(healthy, pid 28960 표시, "✓ installed" 마커) → "hello, say hi in korean" 입력 → reasoning 스트리밍 + 최종 응답 "안녕하세요! 😊" 확인.
   - 최종 패키징 `.\gradlew.bat :desktop:test :desktop:installDist`: BUILD SUCCESSFUL, 테스트 24/24, `desktop/build/install/desktop/bin/offcon-desktop.exe` 16,961,536 bytes + `llama-server.exe` 11,371,008 bytes 스테이징 확인.
 - **참고**: 앱 완전 내장형 이미지 생성(stable-diffusion.cpp `sd-server` 엔진 번들링)은 다음 단계 과제로 남김.
+- **커밋/배포**:
+  - 커밋 `9ae5097` "feat(desktop): one-click model flow with in-app HF catalog, engine guides, settings persistence (v2.2.0)" — 14 files, +1473/−115 (tracked 12 + 신규 `catalog.rs`/`persist.rs`; 스크린샷·로그·`.codex-attachments` 등 untracked 산출물 제외).
+  - `git pull --rebase origin main` = Already up to date → `main` push (726dbd1..9ae5097).
+  - 태그 `v2.2.0` 푸시 → 릴리즈 워크플로 트리거 확인 (run 44144959609).
+  - 로컬 zip 첨부 릴리즈: `desktop/build/install/desktop/bin/*` → `OffconAI-desktop-windows-x86_64.zip` 12,685,730 bytes (SHA-256 `1DEA3CDD...ACA08A0`), 릴리즈 노트 파일 작성 후 `gh release create v2.2.0` 게시 — https://github.com/zmxnpquryet-gif/OffconAI/releases/tag/v2.2.0.
+  - 태그 푸시와 릴리즈 게시 이벤트로 워크플로가 2개 기동됨: push run(44144959609)은 Windows 데스크탑 빌드·APK 빌드·서명 모두 성공했으나 Linux 데스크탑 빌드 중 "The operation was canceled"로 실패(Publish 단계 미실행). release 이벤트 run(44145142246)이 `success`로 완료되어 릴리즈 자산 4종(`app-release.apk` 166,861,748 B, `OffconAI-desktop-linux-x86_64.zip` 18,283,851 B, `OffconAI-desktop-windows-x86_64.zip` 13,114,803 B, `OffconAI-desktop.zip` 18,283,851 B) 모두 게시 확인.
+
+## 2026-11-18 — PR #22/#23/#24 검토 및 장점 선별 병합 (v2.3.0, main)
+
+- **배경**: 열려 있던 PR #22(`9ea82fd`, 모바일 아레나 통합), PR #23(`a7feacb`, 데스크탑+모바일 코드배틀), PR #24(`fae3415`, 데스크탑 아레나 위너)가 모두 v2.2.0 이전(`43cc4bc`) 베이스여서 통째 merge 시 v2.2.0 원클릭 모델 플로우·카탈로그·설정이 회귀함. 따라서 각 PR의 실익 있는 버그 수정·성능·복원력 개선만 선별해 `main` 위에 포팅했다.
+- **데스크탑 선별 반영 (`desktop/`, PR #24 + PR #23)**:
+  - `desktop/src/epoch.rs` (신규, PR #24): 단조 증가 세대 토큰(`EpochGate`, 0 회피 `max(1)`).
+  - `desktop/src/contracts.rs` (PR #23): `normalize_function_arguments` 추가 및 `assistant_with_tool_calls` 적용 — 이중 인코딩 객체 언랩, 스칼라/손상 JSON을 `{"input": ...}`로 래핑해 이후 요청의 HTTP 400 오염 차단.
+  - `desktop/src/session.rs` (PR #24 + PR #23): 턴 간 고유 call ID 생성(`next_call_seq`), `pending_batch` + `resolve_tool`(중복 완료 무해화) + `abort_pending_tools`(미실행 synthetic `role: "tool"` 기록), `build_request`에서 `trim_and_repair_history`(최근 40메시지 / ~16K 토큰 추정, system 보존, 절단면 orphan/dangling tool_calls 복구) 및 `normalize_history` 적용.
+  - `desktop/src/controller.rs` (PR #24 기반 v2.2.0 접목): `runtime_epoch`/`turn_epoch`/`mcp_epoch`/`image_epoch` 4종 게이팅, `loaded_kind` 불일치 시 전송 차단, `backend_changed` 시 이전 런타임 비동기 unload + stale 다운로드 상태 초기화, `DeltaBatcher`(45ms 틱과 일괄 플러시), 2.5초 stop 워치독(`abandon_run`), Decline/Stop/Error/라운드한도/per-turn 한도 초과 시 미완료 tool batch 일괄 종료, 자동 이미지 출력 확장자를 실제 `media_type`에 맞춰 결정.
+  - `desktop/src/transport.rs` (PR #23): 멀티라인 `data:` SSE 이벤트 누적 및 공백 줄 디스패치(`event:`/`id:`/`retry:`/`comment` 무시), 크기 상한(라인 4 MiB, 이벤트 4 MiB, 비스트림 32 MiB, 에러 8 KiB/500자), `ToolCallAssembler` 한도(16 슬롯/16 MiB — 4개 하드 에러 대신 세션 측 `abort_pending_tools`와 조화), `health_url`의 `/v1`·`/chat/completions` 스트립, 추론 키 `thought`/`thinking` 추가.
+  - `desktop/src/mcp.rs` (PR #23, 단 문자열 ID·관대한 `parse_tools` 유지): `initialize` 에러 검사, `tools/list` `nextCursor` 페이지네이션(최대 20페이지/512툴), 응답마다 `Mcp-Session-Id` 회전 갱신, 16 MiB 읽기 상한, 이중 인코딩/스칼라 인자 복구.
+  - `desktop/src/process.rs` & `desktop/src/backends/{llama_cpp,vllm,strata}.rs` (PR #23): `log_tail` 마지막 256 KiB만 seek 읽기, `clear()` 시 로그 경로 초기화, `parse_command` 따옴표 내 이스케이프 지원(Windows 백슬래시 경로 보존), `WaitOutcome` + `wait_for_process_health`(150ms 폴링, 조기 종료 시 exit code 즉시 진단), 관리형 자식 프로세스 `stream` 시 불필요한 `/health` 왕복 생략 및 `load()` 시작 시 무조건 이전 프로세스 정리.
+  - `desktop/src/image_backend.rs` (PR #23): 매직바이트(`PNG`/`JPEG`/`GIF`/`WEBP`) MIME 판별, 64 MiB 이미지/96 MiB 응답 상한, `/images/generations` 풀 URL 허용, 스킴 검증.
+  - `desktop/src/persist.rs` (PR #24 부분 채택): 저장 시 엔드포인트 URL의 내장 자격증명(`user:pass@`) 제거(`redact_url_credentials`), `sync_all()` 후 rename. (v2.2.0의 flat JSON + BOM 허용은 유지.)
+- **데스크탑 의도적 제외 항목**:
+  - PR #24의 `persist.rs`/`controller.rs`/`ui/*.slint` 통째 교체(v2.2.0 카탈로그·다운로드·자동복원 삭제 방지), `session.json` 무제한 디스크 저장 및 Phase UI/단축키 전면 개편(후속 과제로 보류).
+  - PR #23의 `process.rs::sanitize_path`/`resolve_executable`/`stop_child`/`log_path`(main v2.1.1/v2.2.0 번들 탐색 + `CREATE_NO_WINDOW` + `app_data_dir`가 상위), `mcp.rs`의 숫자 전용 `matches_id` 회귀, `arboard` 클립보드 의존성 및 export UI, 미연결 `system_prompt` 필드.
+- **모바일 선별 반영 (`app/`, PR #22 + PR #23 비중복 버그 수정)**:
+  - PR #22(`9ea82fd`)의 `app/src/` 전체 채택(`app/build.gradle.kts` 버전 제외): `ActiveTurnGuard`, `TurnStreamPresenter` + `VisibleTextStream` + `OpenAiSseStream`(O(n²) 토큰당 텍스트 재추출 제거 및 45ms 병합, SSE holdback/오프셋 보정), `ToolRoundBudget` + `McpToolProtocol` 히스토리/홀드백 마커/standalone tool-shape 진단, `PartsLedger` + `SegmentedTransferWorker` URL/세그먼트 무결성 검증, `ChatScrollPolicy`·`ComposerStatus`·`PickerLaunchGuard`·`VoiceUiStatus`·`ReasoningEffortTier`, EN/KO/ZH 리소스 이관 + 48dp 터치 타겟 + `StringCatalogParityTest`/`StringResourceParityTest` 등 신규 단위 테스트.
+  - PR #23(`a7feacb`) 중 PR #22와 겹치지 않는 순수 버그 수정 5건 추가 포팅:
+    - `DocumentIndex.kt` & `DocumentStore.kt`: 전체 DB 로드 대신 선택 `doc_id IN (...)` 스트리밍(900 바인드 배치) + 상위 128청크 `PriorityQueue`로 메모리 상한 보장.
+    - `ModelDownloadService.kt`: `CancellationException` 재전파로 다운로드 교체/취소 시 후속 작업이 `stopSelf()`·오류 상태로 덮이는 레이스 방지.
+    - `HttpWireWriter.kt`: `Cache-Control: no-cache`, `X-Accel-Buffering: no`, `Vary: Origin`, `sendContinue` 추가.
+    - `ReasoningStreamParser.kt` & `ReasoningStreamParserTest.kt`: `<thought>`/`</thought>`, `<thinking>`/`</thinking>` 태그 지원 추가.
+    - `ChatBannersAndDialogs.kt`: MCP 도구 승인 다이얼로그 인자에 `heightIn(max = 240.dp)` + 세로 스크롤 + 잘림 안내 추가.
+  - PR #23 모바일 제외 항목: `McpClient.kt` 전면 교체(문자열 JSON-RPC ID `"5"` 거부 및 엄격한 `"jsonrpc":"2.0"`/`error` 제약 회귀 방지), `ConversationExporter.kt` 미연결 export(후속 과제).
+- **버전**: desktop `2.3.0`, app `versionCode = 26` / `versionName = "2.3.0"`.
+- **검증**:
+  - `desktop` (`RUSTFLAGS="-D warnings" cargo check --tests`): 경고 0개.
+  - `.\gradlew.bat :app:testDebugUnitTest :desktop:test :desktop:installDist`: **BUILD SUCCESSFUL**
+    - Android 단위 테스트: **50 suites, 351 tests, 0 failures, 0 errors, 0 skipped** (PR #22 350개 + PR #23 `ReasoningStreamParserTest` 1개).
+    - Desktop Rust 테스트: **34 passed, 0 failed, 1 ignored** (기존 24 + `epoch` 2 + `contracts` 1 + `session` 2 + `transport` 1 + `mcp` 2 + `image_backend` 1 + `persist` 1).
+    - 스테이징: `desktop/build/install/desktop/bin/offcon-desktop.exe` (17,022,976 bytes) + `llama-server.exe` (11,371,008 bytes).
+  - `.\gradlew.bat :app:assembleDebug`: **BUILD SUCCESSFUL** (arm64-v8a CMake 포함 APK 빌드 통과).

@@ -54,6 +54,7 @@ internal class SegmentedTransferWorker(
     suspend fun fetch(
         taskTitle: String,
         finalUrl: String,
+        sourceKey: String,
         totalSize: Long,
         supportsRange: Boolean,
         targetFile: File,
@@ -67,6 +68,7 @@ internal class SegmentedTransferWorker(
             val ok = downloadSegmented(
                 taskTitle = taskTitle,
                 url = finalUrl,
+                sourceKey = sourceKey,
                 targetFile = targetFile,
                 modelsDir = modelsDir,
                 totalSize = totalSize,
@@ -86,6 +88,7 @@ internal class SegmentedTransferWorker(
     private suspend fun downloadSegmented(
         taskTitle: String,
         url: String,
+        sourceKey: String,
         targetFile: File,
         modelsDir: File,
         totalSize: Long,
@@ -96,29 +99,6 @@ internal class SegmentedTransferWorker(
     ): Boolean {
         val partFiles = (0 until segmentCount).map { i -> File(modelsDir, "${targetFile.name}.part_$i") }
         val metaFile = File(modelsDir, "${targetFile.name}.partsmeta")
-        val metaTotal = try {
-            if (metaFile.isFile) metaFile.readText().trim().toLongOrNull() else null
-        } catch (_: Exception) {
-            null
-        }
-        when {
-            metaTotal == null -> {
-                if (partFiles.any { it.exists() }) {
-                    Log.w(tag, "[$taskTitle] Parts sidecar missing/unreadable; discarding stale parts")
-                    partFiles.forEach { it.delete() }
-                }
-            }
-            metaTotal != totalSize -> {
-                Log.w(tag, "[$taskTitle] Remote size changed ($metaTotal -> $totalSize); discarding stale parts")
-                partFiles.forEach { it.delete() }
-            }
-        }
-        try {
-            metaFile.writeText(totalSize.toString())
-        } catch (e: Exception) {
-            Log.w(tag, "[$taskTitle] Could not write parts sidecar: ${e.message}")
-            partFiles.forEach { it.delete() }
-        }
 
         val segmentStarts = LongArray(segmentCount)
         val segmentEnds = LongArray(segmentCount)
@@ -130,8 +110,35 @@ internal class SegmentedTransferWorker(
             segmentStarts[i] = i * chunkSize
             segmentEnds[i] = if (i == segmentCount - 1) totalSize - 1L else (i + 1) * chunkSize - 1L
             segmentTotals[i] = segmentEnds[i] - segmentStarts[i] + 1L
-            val existing = if (partFiles[i].exists()) partFiles[i].length().coerceAtMost(segmentTotals[i]) else 0L
-            segmentDownloaded[i].set(existing)
+        }
+
+        val existingLedger = try {
+            if (metaFile.isFile) PartsLedger.parse(metaFile.readText()) else null
+        } catch (_: Exception) {
+            null
+        }
+        val existingLengths = partFiles.map { part -> if (part.exists()) part.length() else 0L }
+        // Resume only when the sidecar names this exact source *and* the recorded layout,
+        // and every part still fits its segment. Otherwise the parts are someone else's
+        // bytes (or a different layout) and must not be appended to.
+        var resume = PartsLedger.matches(existingLedger, totalSize, sourceKey) &&
+            PartsLedger.resumable(existingLengths, segmentTotals)
+        if (!resume && existingLengths.any { it > 0L }) {
+            Log.w(tag, "[$taskTitle] Discarding segment parts that do not belong to this download")
+            partFiles.forEach { it.delete() }
+        }
+        try {
+            metaFile.writeText(PartsLedger(totalSize, PartsLedger.sourceDigest(sourceKey)).encode())
+        } catch (e: Exception) {
+            Log.w(tag, "[$taskTitle] Could not write parts sidecar: ${e.message}")
+            // Without a sidecar the next run cannot prove where these parts came from, so
+            // they are dropped now instead of being resumed blindly later.
+            resume = false
+            partFiles.forEach { it.delete() }
+        }
+
+        for (i in 0 until segmentCount) {
+            segmentDownloaded[i].set(if (resume) existingLengths[i] else 0L)
         }
 
         var downloadFailed = false

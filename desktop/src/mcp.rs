@@ -6,9 +6,15 @@ use crate::contracts::ToolDefinition;
 use reqwest::blocking::Client;
 use reqwest::Url;
 use serde_json::{json, Value};
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+const MAX_MCP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MCP_ERROR_CHARS: usize = 500;
+const MAX_TOOL_PAGES: usize = 20;
+const MAX_TOOLS_TOTAL: usize = 512;
 
 #[derive(Clone, Debug)]
 pub struct McpConnectionInfo {
@@ -108,8 +114,11 @@ impl McpClient {
         })
         .to_string();
 
-        let (session_id, init_body) =
+        let (mut session_id, init_body) =
             self.post_rpc(clean_url, &init_payload, None, token.as_deref(), Some(init_id))?;
+        if let Some(msg) = rpc_error_message(&init_body) {
+            return Err(format!("MCP initialize failed: {msg}"));
+        }
         let server_name = parse_server_name(&init_body)
             .unwrap_or_else(|| parsed.host_str().unwrap_or("MCP").to_string());
 
@@ -119,39 +128,65 @@ impl McpClient {
             "params": {}
         })
         .to_string();
-        let _ = self.post_rpc(
+        if let Ok((Some(new_sid), _)) = self.post_rpc(
             clean_url,
             &initialized_notif,
             session_id.as_deref(),
             token.as_deref(),
             None,
-        );
-
-        let list_id = self.next_id();
-        let list_payload = json!({
-            "jsonrpc": "2.0",
-            "id": list_id,
-            "method": "tools/list",
-            "params": {}
-        })
-        .to_string();
-        let (_, list_body) = self.post_rpc(
-            clean_url,
-            &list_payload,
-            session_id.as_deref(),
-            token.as_deref(),
-            Some(list_id),
-        )?;
-
-        if let Some(err) = list_body.get("error").filter(|v| !v.is_null()) {
-            let msg = err
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("MCP tools/list returned an error");
-            return Err(msg.to_string());
+        ) {
+            session_id = Some(new_sid);
         }
 
-        let tools = parse_tools(&list_body);
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_TOOL_PAGES {
+            let list_id = self.next_id();
+            let params = match &cursor {
+                Some(c) => json!({ "cursor": c }),
+                None => json!({}),
+            };
+            let list_payload = json!({
+                "jsonrpc": "2.0",
+                "id": list_id,
+                "method": "tools/list",
+                "params": params
+            })
+            .to_string();
+            let (new_sid, list_body) = self.post_rpc(
+                clean_url,
+                &list_payload,
+                session_id.as_deref(),
+                token.as_deref(),
+                Some(list_id),
+            )?;
+            if let Some(sid) = new_sid {
+                session_id = Some(sid);
+            }
+            if let Some(msg) = rpc_error_message(&list_body) {
+                return Err(msg);
+            }
+            let page_tools = parse_tools(&list_body);
+            for tool in page_tools {
+                if tools.len() >= MAX_TOOLS_TOTAL {
+                    break;
+                }
+                tools.push(tool);
+            }
+            let next_cursor = list_body
+                .get("result")
+                .and_then(|r| r.get("nextCursor"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(str::to_string);
+            match next_cursor {
+                Some(next) if Some(&next) != cursor.as_ref() && tools.len() < MAX_TOOLS_TOTAL => {
+                    cursor = Some(next);
+                }
+                _ => break,
+            }
+        }
         let latency_ms = started.elapsed().as_millis();
 
         let mut guard = self.state.lock().expect("mcp state lock");
@@ -180,17 +215,12 @@ impl McpClient {
             (ep, guard.session_id.clone(), guard.bearer_token.clone())
         };
 
-        let raw_args = if arguments_json.trim().is_empty() {
-            "{}"
-        } else {
-            arguments_json.trim()
-        };
-        let args_val: Value = match serde_json::from_str(raw_args) {
-            Ok(Value::Object(map)) => Value::Object(map),
-            _ => {
+        let args_val = match parse_tool_arguments(arguments_json) {
+            Ok(val) => val,
+            Err(msg) => {
                 return McpCallOutcome {
                     is_success: false,
-                    output: "Tool arguments are not a valid JSON object.".into(),
+                    output: msg,
                 };
             }
         };
@@ -207,7 +237,7 @@ impl McpClient {
         })
         .to_string();
 
-        let (_, body) = match self.post_rpc(
+        let (new_sid, body) = match self.post_rpc(
             &endpoint,
             &payload,
             session_id.as_deref(),
@@ -222,12 +252,14 @@ impl McpClient {
                 };
             }
         };
+        if let Some(sid) = new_sid {
+            let mut guard = self.state.lock().expect("mcp state lock");
+            if guard.endpoint.as_deref() == Some(&endpoint) {
+                guard.session_id = Some(sid);
+            }
+        }
 
-        if let Some(err) = body.get("error").filter(|v| !v.is_null()) {
-            let msg = err
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("Unknown MCP error");
+        if let Some(msg) = rpc_error_message(&body) {
             return McpCallOutcome {
                 is_success: false,
                 output: format!("MCP tool error: {msg}"),
@@ -295,10 +327,13 @@ impl McpClient {
             .headers()
             .get("Mcp-Session-Id")
             .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let raw = resp.text().unwrap_or_default();
+        let raw = read_bounded_mcp(resp, MAX_MCP_RESPONSE_BYTES)?;
         if !status.is_success() {
-            return Err(format!("HTTP {status}: {raw}"));
+            let preview: String = raw.chars().take(MAX_MCP_ERROR_CHARS).collect();
+            return Err(format!("HTTP {status}: {preview}"));
         }
         if expected_id.is_none() {
             return Ok((new_sid, Value::Null));
@@ -307,6 +342,52 @@ impl McpClient {
             .ok_or_else(|| "MCP response was not valid JSON-RPC.".to_string())?;
         Ok((new_sid, body))
     }
+}
+
+fn read_bounded_mcp(resp: reqwest::blocking::Response, limit: usize) -> Result<String, String> {
+    let mut buf = Vec::new();
+    resp.take((limit as u64).saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("failed to read MCP response: {e}"))?;
+    if buf.len() > limit {
+        return Err(format!("MCP response exceeded {limit} byte limit"));
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn rpc_error_message(envelope: &Value) -> Option<String> {
+    let err = envelope.get("error").filter(|v| !v.is_null())?;
+    let msg = match err {
+        Value::String(s) => s.clone(),
+        Value::Object(map) => map
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| err.to_string()),
+        _ => err.to_string(),
+    };
+    Some(msg.chars().take(MAX_MCP_ERROR_CHARS).collect())
+}
+
+fn parse_tool_arguments(raw: &str) -> Result<Value, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(json!({}));
+    }
+    let mut val: Value = serde_json::from_str(trimmed)
+        .map_err(|_| "Tool arguments are not valid JSON.".to_string())?;
+    for _ in 0..3 {
+        let Value::String(inner) = &val else { break };
+        if let Ok(parsed) = serde_json::from_str::<Value>(inner.trim()) {
+            val = parsed;
+        } else {
+            break;
+        }
+    }
+    Ok(match val {
+        Value::Object(_) => val,
+        other => json!({ "input": other }),
+    })
 }
 
 fn parse_server_name(envelope: &Value) -> Option<String> {
@@ -362,24 +443,35 @@ pub(crate) fn extract_json_rpc_message(raw: &str, expected_id: Option<u64>) -> O
     }
     if trimmed.starts_with('{') {
         let obj: Value = serde_json::from_str(trimmed).ok()?;
-        return matches_id(&obj, expected_id).then_some(obj);
+        return (matches_id(&obj, expected_id) && is_json_rpc_response(&obj)).then_some(obj);
     }
-    for line in trimmed.lines() {
-        let t = line.trim();
-        let Some(payload) = t.strip_prefix("data:") else {
-            continue;
-        };
-        let payload = payload.trim();
-        if payload.is_empty() || payload == "[DONE]" {
+    let mut data_buf = Vec::<String>::new();
+    for line in trimmed.lines().chain(std::iter::once("")) {
+        let t = line.trim_end_matches('\r');
+        if t.trim().is_empty() {
+            if !data_buf.is_empty() {
+                let payload = data_buf.join("\n");
+                data_buf.clear();
+                let payload = payload.trim();
+                if !payload.is_empty() && payload != "[DONE]" {
+                    if let Ok(obj) = serde_json::from_str::<Value>(payload) {
+                        if matches_id(&obj, expected_id) && is_json_rpc_response(&obj) {
+                            return Some(obj);
+                        }
+                    }
+                }
+            }
             continue;
         }
-        if let Ok(obj) = serde_json::from_str::<Value>(payload) {
-            if matches_id(&obj, expected_id) && (obj.get("result").is_some() || obj.get("error").is_some()) {
-                return Some(obj);
-            }
+        if let Some(rest) = t.trim_start().strip_prefix("data:") {
+            data_buf.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
         }
     }
     None
+}
+
+fn is_json_rpc_response(obj: &Value) -> bool {
+    obj.get("result").is_some() || obj.get("error").is_some()
 }
 
 fn matches_id(obj: &Value, expected_id: Option<u64>) -> bool {
@@ -515,5 +607,26 @@ mod tests {
         let outcome = client.call_tool("get_weather", r#"{"city":"Seoul"}"#);
         assert!(outcome.is_success);
         assert_eq!(outcome.output, "Seoul: 18C Clear");
+    }
+
+    #[test]
+    fn recovers_double_encoded_and_scalar_tool_arguments() {
+        assert_eq!(parse_tool_arguments("").unwrap(), json!({}));
+        assert_eq!(
+            parse_tool_arguments(r#""{\"city\":\"Busan\"}""#).unwrap(),
+            json!({"city": "Busan"})
+        );
+        assert_eq!(
+            parse_tool_arguments(r#""hello""#).unwrap(),
+            json!({"input": "hello"})
+        );
+        assert!(parse_tool_arguments("{broken").is_err());
+    }
+
+    #[test]
+    fn accepts_string_ids_and_multiline_sse_json_rpc() {
+        let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"7\",\ndata: \"result\":{\"ok\":true}}\n\n";
+        let msg = extract_json_rpc_message(sse, Some(7)).expect("parsed string-id response");
+        assert_eq!(msg["result"]["ok"], json!(true));
     }
 }

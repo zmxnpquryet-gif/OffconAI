@@ -2,7 +2,7 @@
 //! Hardware arguments stay backend-specific; transport events stay uniform.
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
@@ -213,11 +213,7 @@ impl ChatMessage {
                 kind: "function".into(),
                 function: OpenAiFunctionCall {
                     name: call.name.clone(),
-                    arguments: if call.arguments.trim().is_empty() {
-                        "{}".into()
-                    } else {
-                        call.arguments.clone()
-                    },
+                    arguments: normalize_function_arguments(&call.arguments),
                 },
             })
             .collect();
@@ -325,6 +321,33 @@ pub struct ImageResult {
     pub media_type: String,
 }
 
+/// Rewrites a streamed `function.arguments` string into a valid JSON-object
+/// string so committed history can never poison later requests. Recovers
+/// double-encoded objects (`"{\"a\":1}"` -> `{"a":1}`) and wraps scalars or
+/// malformed JSON as `{"input": ...}`.
+pub fn normalize_function_arguments(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "{}".to_string();
+    }
+    let mut value = match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => value,
+        Err(_) => return json!({"input": trimmed}).to_string(),
+    };
+    // Unwrap double-encoded JSON strings (at most a few levels).
+    for _ in 0..3 {
+        let Value::String(inner) = &value else { break };
+        match serde_json::from_str::<Value>(inner.trim()) {
+            Ok(parsed) => value = parsed,
+            Err(_) => break,
+        }
+    }
+    match value {
+        Value::Object(_) => value.to_string(),
+        other => json!({"input": other}).to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +384,26 @@ mod tests {
             explicit.with_default_model(Some("qwen3.5-4b")).model.as_deref(),
             Some("custom-id")
         );
+    }
+
+    #[test]
+    fn normalizes_broken_double_encoded_and_scalar_tool_arguments() {
+        assert_eq!(normalize_function_arguments(""), "{}");
+        assert_eq!(normalize_function_arguments("  "), "{}");
+        assert_eq!(normalize_function_arguments(r#"{"city":"Seoul"}"#), r#"{"city":"Seoul"}"#);
+        assert_eq!(normalize_function_arguments(r#""{\"city\":\"Seoul\"}""#), r#"{"city":"Seoul"}"#);
+        assert_eq!(normalize_function_arguments(r#""Seoul""#), r#"{"input":"Seoul"}"#);
+        assert_eq!(normalize_function_arguments("{bad json"), r#"{"input":"{bad json"}"#);
+
+        let msg = ChatMessage::assistant_with_tool_calls(
+            "",
+            &[ToolCallRecord {
+                id: Some("c1".into()),
+                name: "f".into(),
+                arguments: "{bad".into(),
+            }],
+        );
+        let calls = msg.tool_calls.unwrap();
+        assert_eq!(calls[0].function.arguments, r#"{"input":"{bad"}"#);
     }
 }

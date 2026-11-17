@@ -337,4 +337,90 @@ class ModelDownloaderTest {
         dir.deleteRecursively()
         Unit
     }
+
+    // ---------------- segmented resume identity ----------------
+
+    @Test
+    fun `parts sidecar binds the parts to one source and one layout`() {
+        val sourceA = "https://huggingface.co/org/repo/resolve/main/model.gguf"
+        val sourceB = "https://mirror.example/org/repo/model.gguf"
+        val total = 6L * 1024 * 1024
+
+        val ledger = PartsLedger(total, PartsLedger.sourceDigest(sourceA))
+        val encoded = ledger.encode()
+        assertEquals(ledger, PartsLedger.parse(encoded))
+        assertTrue(PartsLedger.matches(PartsLedger.parse(encoded), total, sourceA))
+        assertFalse("a different source must not resume these parts", PartsLedger.matches(PartsLedger.parse(encoded), total, sourceB))
+        assertFalse("a changed size must not resume these parts", PartsLedger.matches(PartsLedger.parse(encoded), total + 1, sourceA))
+
+        // The legacy sidecar was the bare size: it cannot prove the source, so it is
+        // treated as unknown and the parts are discarded.
+        assertNull(PartsLedger.parse(total.toString()))
+        assertNull(PartsLedger.parse(""))
+        assertNull(PartsLedger.parse(null))
+        assertNull(PartsLedger.parse("v2:not-a-number:${PartsLedger.sourceDigest(sourceA)}"))
+        assertNull(PartsLedger.parse("v2:$total:zzzz"))
+    }
+
+    @Test
+    fun `an oversized part blocks resume instead of failing every retry`() {
+        val totals = longArrayOf(100, 100, 100, 100)
+        assertTrue(PartsLedger.resumable(listOf(0, 100, 40, 0), totals))
+        assertFalse("a part longer than its segment is a different layout", PartsLedger.resumable(listOf(101, 0, 0, 0), totals))
+        assertFalse(PartsLedger.resumable(listOf(0, 0, 0), totals))
+    }
+
+    @Test
+    fun `resuming from parts of another source re-downloads instead of merging them`() = runBlocking {
+        val size = 6 * 1024 * 1024
+        val stale = ByteArray(size) { 'A'.code.toByte() }
+        val fresh = ByteArray(size) { 'B'.code.toByte() }
+        // A real GGUF header on both payloads, so only the bytes themselves differ.
+        fresh[0] = 'G'.code.toByte(); fresh[1] = 'G'.code.toByte(); fresh[2] = 'U'.code.toByte(); fresh[3] = 'F'.code.toByte()
+        stale[0] = 'G'.code.toByte(); stale[1] = 'G'.code.toByte(); stale[2] = 'U'.code.toByte(); stale[3] = 'F'.code.toByte()
+
+        val dir = tempDir()
+        val target = File(dir, "model.gguf")
+        // Simulate an interrupted download from a different URL: a matching sidecar for
+        // the *stale* source, with the first half of every segment already written.
+        val staleUrl = "http://fake.invalid/stale"
+        File(dir, "${target.name}.partsmeta")
+            .writeText(PartsLedger(size.toLong(), PartsLedger.sourceDigest(staleUrl)).encode())
+        val segmentSize = size / 4
+        for (index in 0 until 4) {
+            File(dir, "${target.name}.part_$index").writeBytes(
+                stale.copyOfRange(index * segmentSize, index * segmentSize + segmentSize / 2)
+            )
+        }
+
+        val interceptor = FakeInterceptor({ request ->
+            val range = request.header("Range")
+            val responseBuilder = Response.Builder()
+                .request(request)
+                .protocol(okhttp3.Protocol.HTTP_1_1)
+            if (range == null) {
+                return@FakeInterceptor responseBuilder.code(206)
+                    .message("Partial Content")
+                    .header("Content-Range", "bytes 0-0/$size")
+                    .body(ByteArray(1).toResponseBody())
+                    .build()
+            }
+            val parts = range.removePrefix("bytes=").split("-")
+            val start = parts[0].toLong()
+            val end = parts[1].toLong()
+            responseBuilder.code(206)
+                .message("Partial Content")
+                .header("Content-Range", "bytes $start-$end/$size")
+                .body(fresh.copyOfRange(start.toInt(), (end + 1).toInt()).toResponseBody())
+            responseBuilder.build()
+        })
+        val downloader = ModelDownloader(OkHttpClient.Builder().addInterceptor(interceptor).build())
+        val statuses = downloader.downloadUnifiedBundle(model("http://fake.invalid/fresh"), dir).toList()
+
+        assertTrue(statuses.last().isCompleted)
+        assertArrayEquals("stale parts from another source leaked into the file", fresh, target.readBytes())
+        assertFalse("the stale sidecar must be gone", File(dir, "${target.name}.partsmeta").exists())
+        dir.deleteRecursively()
+        Unit
+    }
 }

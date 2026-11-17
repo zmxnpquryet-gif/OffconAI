@@ -4,6 +4,7 @@ pub mod backends;
 pub mod catalog;
 pub mod contracts;
 pub mod controller;
+pub mod epoch;
 pub mod image_backend;
 pub mod mcp;
 pub mod persist;

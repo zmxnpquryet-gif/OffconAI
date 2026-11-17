@@ -436,6 +436,7 @@ class OllamaApiServer(
             if (isStream) {
                 HttpWireWriter.sendStreamHeaders(output, "application/x-ndjson", origin)
                 var failed = false
+                var emittedContentLength = 0
                 try {
                     llmEngine.streamGenerate(
                         prompt = prompt,
@@ -444,8 +445,15 @@ class OllamaApiServer(
                         attachment = null,
                         numPredictOverride = request.numPredict
                     ).collect { chunk ->
-                        if (chunk.token.isNotEmpty()) {
-                            HttpWireWriter.sendChunk(output, buildOllamaLine(chunk.token, done = false) + "\n")
+                        // Stream the reply body, never the raw token: a reasoning model
+                        // emits its <think> channel through `token`, and those bytes must
+                        // not become the answer. The content buffer is append-only, so
+                        // its growth is exactly the missing delta.
+                        val content = chunk.currentContentText
+                        if (content.length > emittedContentLength) {
+                            val delta = content.substring(emittedContentLength)
+                            emittedContentLength = content.length
+                            HttpWireWriter.sendChunk(output, buildOllamaLine(delta, done = false) + "\n")
                         }
                     }
                 } catch (e: Exception) {
@@ -463,7 +471,7 @@ class OllamaApiServer(
                 }
                 HttpWireWriter.endChunk(output)
             } else {
-                val answer = StringBuilder()
+                var answer = ""
                 var totalTokens = 0
                 try {
                     llmEngine.streamGenerate(
@@ -473,7 +481,7 @@ class OllamaApiServer(
                         attachment = null,
                         numPredictOverride = request.numPredict
                     ).collect { chunk ->
-                        if (chunk.token.isNotEmpty()) answer.append(chunk.token)
+                        answer = chunk.currentContentText
                         totalTokens = chunk.totalTokens
                     }
                 } catch (e: Exception) {
@@ -488,7 +496,7 @@ class OllamaApiServer(
                     HttpWireWriter.sendResponse(output, status, statusLabel, "application/json", JSONObject().put("error", errText).toString(), origin)
                     return
                 }
-                HttpWireWriter.sendResponse(output, 200, "OK", "application/json", buildOllamaLine(answer.toString(), done = true, evalCount = totalTokens), origin)
+                HttpWireWriter.sendResponse(output, 200, "OK", "application/json", buildOllamaLine(answer, done = true, evalCount = totalTokens), origin)
             }
         } finally {
             generationSlots.release()
@@ -536,63 +544,22 @@ class OllamaApiServer(
 
         try {
             if (isStream) {
-                HttpWireWriter.sendStreamHeaders(output, "text/event-stream", origin)
-                var finalContentText = ""
-                var emittedVisibleLen = 0
-                try {
-                    llmEngine.streamGenerate(
+                OpenAiSseStream.writeChatCompletion(
+                    output = output,
+                    origin = origin,
+                    chunks = llmEngine.streamGenerate(
                         prompt = lastUserPrompt,
                         history = historyList,
                         settings = request.settings,
                         attachment = null,
                         mcpToolsContext = toolsPrompt,
                         numPredictOverride = request.numPredict
-                    ).collect { chunk ->
-                        finalContentText = chunk.currentContentText
-                        if (toolsPrompt == null) {
-                            if (chunk.token.isNotEmpty()) {
-                                HttpWireWriter.sendChunk(output, ApiPayloadMapper.buildOpenAiSseChunk(chatId, modelName, chunk.token, null))
-                            }
-                        } else {
-                            val visible = McpToolProtocol.visibleText(finalContentText, toolDialect)
-                            if (visible.length > emittedVisibleLen && visible.startsWith(finalContentText.take(emittedVisibleLen).let { McpToolProtocol.visibleText(it, toolDialect) })) {
-                                val delta = visible.substring(emittedVisibleLen)
-                                if (delta.isNotEmpty()) {
-                                    HttpWireWriter.sendChunk(output, ApiPayloadMapper.buildOpenAiSseChunk(chatId, modelName, delta, null))
-                                }
-                                emittedVisibleLen = visible.length
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    if (e is CancellationException) throw e
-                    val errText = if (isBusyError(e)) {
-                        "Server is busy: another generation is already running."
-                    } else {
-                        "Inference failed: ${e.localizedMessage}"
-                    }
-                    HttpWireWriter.sendChunk(output, ApiPayloadMapper.buildOpenAiSseChunk(chatId, modelName, null, "stop", errText))
-                    HttpWireWriter.sendChunk(output, "data: [DONE]\n\n")
-                    HttpWireWriter.endChunk(output)
-                    return
-                }
-                val parsedBatch = if (toolsPrompt != null) {
-                    McpToolProtocol.parseBatch(finalContentText, offeredTools, template = toolDialect)
-                } else null
-                if (parsedBatch != null && parsedBatch.calls.isNotEmpty()) {
-                    HttpWireWriter.sendChunk(output, ApiPayloadMapper.buildOpenAiToolCallSseChunk(chatId, modelName, parsedBatch.calls))
-                    HttpWireWriter.sendChunk(output, ApiPayloadMapper.buildOpenAiSseChunk(chatId, modelName, null, "tool_calls"))
-                } else {
-                    if (toolsPrompt != null && finalContentText.length > emittedVisibleLen) {
-                        val rest = finalContentText.substring(emittedVisibleLen)
-                        if (rest.isNotEmpty()) {
-                            HttpWireWriter.sendChunk(output, ApiPayloadMapper.buildOpenAiSseChunk(chatId, modelName, rest, null))
-                        }
-                    }
-                    HttpWireWriter.sendChunk(output, ApiPayloadMapper.buildOpenAiSseChunk(chatId, modelName, null, "stop"))
-                }
-                HttpWireWriter.sendChunk(output, "data: [DONE]\n\n")
-                HttpWireWriter.endChunk(output)
+                    ),
+                    chatId = chatId,
+                    modelName = modelName,
+                    dialect = if (toolsPrompt != null) toolDialect else null,
+                    offeredTools = offeredTools
+                )
             } else {
                 var finalContentText = ""
                 var totalTokens = 0
@@ -627,7 +594,14 @@ class OllamaApiServer(
                 val responseBody = if (parsedBatch != null && parsedBatch.calls.isNotEmpty()) {
                     ApiPayloadMapper.buildOpenAiCompletionJson(chatId, modelName, parsedBatch.prose, totalTokens, parsedBatch.calls)
                 } else {
-                    ApiPayloadMapper.buildOpenAiCompletionJson(chatId, modelName, finalContentText, totalTokens)
+                    // Same visible text the streaming path ends with: markup the model
+                    // emitted is not part of the answer.
+                    val answer = if (toolsPrompt != null) {
+                        McpToolProtocol.visibleText(finalContentText, toolDialect)
+                    } else {
+                        finalContentText
+                    }
+                    ApiPayloadMapper.buildOpenAiCompletionJson(chatId, modelName, answer, totalTokens)
                 }
                 HttpWireWriter.sendResponse(
                     output,

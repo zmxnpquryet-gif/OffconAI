@@ -34,6 +34,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.localllm.android.R
 import com.localllm.android.model.Conversation
+import com.localllm.android.ui.glass.GCompactIconButton
 import com.localllm.android.ui.glass.GDialog
 import com.localllm.android.ui.glass.GDivider
 import com.localllm.android.ui.glass.GIcon
@@ -195,7 +196,7 @@ fun ChatDrawer(
             verticalAlignment = Alignment.CenterVertically
         ) {
             GText(
-                text = "최근 대화",
+                text = stringResource(R.string.drawer_recent_chats),
                 style = GlassTheme.type.labelMedium,
                 color = GlassTheme.colors.onSurfaceVariant
             )
@@ -260,12 +261,11 @@ fun ChatDrawer(
 
                         if (isSelected) {
                             Row {
-                                GIconButton(
+                                GCompactIconButton(
                                     onClick = {
                                         renameTargetConv = conv
                                         newTitleInput = conv.title
-                                    },
-                                    modifier = Modifier.size(24.dp)
+                                    }
                                 ) {
                                     GIcon(
                                         imageVector = GIcons.Edit,
@@ -275,9 +275,8 @@ fun ChatDrawer(
                                     )
                                 }
                                 Spacer(modifier = Modifier.width(4.dp))
-                                GIconButton(
-                                    onClick = { onDeleteConversation(conv.id) },
-                                    modifier = Modifier.size(24.dp)
+                                GCompactIconButton(
+                                    onClick = { onDeleteConversation(conv.id) }
                                 ) {
                                     GIcon(
                                         imageVector = GIcons.Delete,
@@ -303,7 +302,7 @@ fun ChatDrawer(
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             GText(
-                text = "도구",
+                text = stringResource(R.string.drawer_tools),
                 style = GlassTheme.type.labelMedium,
                 color = GlassTheme.colors.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)

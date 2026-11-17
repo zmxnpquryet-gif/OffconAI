@@ -6,7 +6,7 @@ use crate::contracts::{
 };
 use crate::process::{
     default_threads, log_path, log_tail, resolve_executable, sanitize_path, spawn_with_log,
-    wait_for, ProcessSlot,
+    wait_for_process_health, ProcessSlot, WaitOutcome,
 };
 use crate::transport::OpenAiTransport;
 use std::path::Path;
@@ -118,14 +118,24 @@ impl LlmBackend for LlamaCpp {
         let child = spawn_with_log(command, &log)?;
         self.slot.store_child(child, log.clone());
         self.slot.set_loaded(model.effective_served_id());
-        if !wait_for(Duration::from_secs(90), || {
-            self.slot.alive() && self.transport.health_available(&self.base_url())
+        match wait_for_process_health(&self.slot, Duration::from_secs(90), || {
+            self.transport.health_available(&self.base_url())
         }) {
-            let tail = log_tail(Some(&log), 20);
-            self.slot.clear();
-            return Err(format!("llama-server did not become healthy. {tail}"));
+            WaitOutcome::Ready => Ok(()),
+            WaitOutcome::Exited(code) => {
+                let tail = log_tail(Some(&log), 20);
+                self.slot.clear();
+                Err(format!(
+                    "llama-server exited early (code {:?}). {tail}",
+                    code
+                ))
+            }
+            WaitOutcome::TimedOut => {
+                let tail = log_tail(Some(&log), 20);
+                self.slot.clear();
+                Err(format!("llama-server did not become healthy. {tail}"))
+            }
         }
-        Ok(())
     }
 
     fn unload(&self) {
@@ -138,7 +148,12 @@ impl LlmBackend for LlamaCpp {
         cancel: &AtomicBool,
         listener: &mut dyn FnMut(StreamEvent),
     ) {
-        if !self.transport.health_available(&self.base_url()) {
+        let ready = if self.slot.has_child() {
+            self.slot.alive()
+        } else {
+            self.transport.health_available(&self.base_url())
+        };
+        if !ready {
             listener(StreamEvent::Error(format!(
                 "llama-server is not loaded or reachable at {}",
                 self.base_url()

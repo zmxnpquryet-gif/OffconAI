@@ -2,9 +2,14 @@
 
 use crate::contracts::{ImageGenerationBackend, ImageRequest, ImageResult};
 use base64::Engine;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
 use serde_json::{json, Value};
+use std::io::Read;
 use std::time::Duration;
+
+const MAX_IMAGE_RESPONSE_BYTES: usize = 96 * 1024 * 1024;
+const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_IMAGE_ERROR_CHARS: usize = 500;
 
 pub struct OpenAiImageBackend {
     base_url: String,
@@ -25,7 +30,9 @@ impl OpenAiImageBackend {
     }
 
     fn endpoint(&self) -> String {
-        if self.base_url.ends_with("/v1") {
+        if self.base_url.ends_with("/images/generations") {
+            self.base_url.clone()
+        } else if self.base_url.ends_with("/v1") {
             format!("{}/images/generations", self.base_url)
         } else {
             format!("{}/v1/images/generations", self.base_url)
@@ -33,14 +40,40 @@ impl OpenAiImageBackend {
     }
 }
 
+fn read_bounded_bytes(resp: Response, limit: usize) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    resp.take((limit as u64).saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|error| format!("Image response could not be read: {error}"))?;
+    if buf.len() > limit {
+        return Err(format!("Image response exceeded {limit} byte limit"));
+    }
+    Ok(buf)
+}
+
+pub fn detect_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) || bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
 impl ImageGenerationBackend for OpenAiImageBackend {
     fn available(&self) -> bool {
-        !self.base_url.is_empty()
+        let lower = self.base_url.to_ascii_lowercase();
+        lower.starts_with("http://") || lower.starts_with("https://")
     }
 
     fn generate(&self, request: &ImageRequest) -> Result<ImageResult, String> {
         if !self.available() {
-            return Err("Image endpoint is not configured".into());
+            return Err("Image endpoint must start with http:// or https://".into());
         }
         let body = json!({
             "model": request.model,
@@ -61,11 +94,11 @@ impl ImageGenerationBackend for OpenAiImageBackend {
             .send()
             .map_err(|error| format!("Image generation failed: {error}"))?;
         let status = response.status();
-        let payload = response
-            .text()
-            .map_err(|error| format!("Image response could not be read: {error}"))?;
+        let raw_bytes = read_bounded_bytes(response, MAX_IMAGE_RESPONSE_BYTES)?;
+        let payload = String::from_utf8_lossy(&raw_bytes);
         if !status.is_success() {
-            return Err(format!("Image API HTTP {status}: {payload}"));
+            let preview: String = payload.chars().take(MAX_IMAGE_ERROR_CHARS).collect();
+            return Err(format!("Image API HTTP {status}: {preview}"));
         }
         let value: Value = serde_json::from_str(&payload)
             .map_err(|error| format!("Image response is not JSON: {error}"))?;
@@ -80,10 +113,13 @@ impl ImageGenerationBackend for OpenAiImageBackend {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
                 .map_err(|error| format!("Image base64 was invalid: {error}"))?;
-            return Ok(ImageResult {
-                bytes,
-                media_type: "image/png".into(),
-            });
+            if bytes.len() > MAX_IMAGE_BYTES {
+                return Err("Decoded image exceeded 64 MiB limit".into());
+            }
+            let media_type = detect_image_media_type(&bytes)
+                .unwrap_or("image/png")
+                .to_string();
+            return Ok(ImageResult { bytes, media_type });
         }
         if let Some(url) = value
             .get("data")
@@ -103,16 +139,16 @@ impl ImageGenerationBackend for OpenAiImageBackend {
             if !status.is_success() {
                 return Err(format!("Image download HTTP {status}"));
             }
-            let media_type = response
+            let header_type = response
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
-                .unwrap_or("image/png")
-                .to_string();
-            let bytes = response
-                .bytes()
-                .map_err(|error| format!("Image download could not be read: {error}"))?
-                .to_vec();
+                .map(str::to_string);
+            let bytes = read_bounded_bytes(response, MAX_IMAGE_BYTES)?;
+            let media_type = detect_image_media_type(&bytes)
+                .map(str::to_string)
+                .or(header_type)
+                .unwrap_or_else(|| "image/png".into());
             return Ok(ImageResult { bytes, media_type });
         }
         Err("Image response contained neither b64_json nor url".into())
@@ -140,5 +176,14 @@ mod tests {
             })
             .expect("image response decodes");
         assert_eq!(result.bytes, png);
+        assert_eq!(result.media_type, "image/png");
+    }
+
+    #[test]
+    fn detects_jpeg_webp_gif_and_png_magic_bytes() {
+        assert_eq!(detect_image_media_type(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(detect_image_media_type(b"GIF89a..."), Some("image/gif"));
+        assert_eq!(detect_image_media_type(b"RIFF\x00\x00\x00\x00WEBP"), Some("image/webp"));
+        assert_eq!(detect_image_media_type(b"unknown"), None);
     }
 }

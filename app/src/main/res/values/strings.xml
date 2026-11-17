@@ -656,4 +656,45 @@
     <string name="chat_empty_suggest_api">How do I connect through the local API?</string>
     <string name="chat_empty_footer">No account · No telemetry · Offline inference</string>
     <string name="chat_input_hint">Message</string>
+
+    <!-- Composer: attachments, status strip, touch/semantics copy -->
+    <string name="chat_attachment_image">Image</string>
+    <string name="chat_attachment_file">File</string>
+    <string name="chat_attachment_remove">Remove attachment</string>
+    <string name="chat_status_prefill">Processing prompt · %1$s tok/s</string>
+    <string name="chat_status_generating">Generating…</string>
+    <string name="chat_status_metrics">%1$s tok/s · %2$d ctx</string>
+    <string name="chat_status_loading_progress">%1$s · %2$d%%</string>
+    <string name="chat_status_preparing_image">Preparing image input…</string>
+    <string name="chat_state_ready_to_send">Ready to send</string>
+    <string name="chat_state_streaming">Streaming · tap to stop</string>
+    <string name="chat_send_disabled_hint">Type a message or attach a file to send</string>
+    <string name="chat_reasoning_effort_with_value">%1$s (%2$s)</string>
+    <string name="chat_reasoning_effort_expand">Adjust reasoning effort</string>
+    <string name="chat_state_expanded">Expanded</string>
+    <string name="chat_state_collapsed">Collapsed</string>
+    <string name="chat_attach_opening">Opening the picker…</string>
+    <string name="chat_library_empty">No documents in the library yet. Attach a PDF, XLSX, PPTX or text file to search it in this chat.</string>
+
+    <!-- Voice screen: native-audio facts, explicit states, microphone semantics -->
+    <string name="voice_native_session_title">Native audio session</string>
+    <string name="voice_native_session_desc">Microphone audio (16 kHz PCM) is fed straight to the model; reply text and speech arrive together.</string>
+    <string name="voice_native_model_fallback">Native audio model</string>
+    <string name="voice_mode_header_native">%1$s · native audio in → audio out · one tap per turn</string>
+    <string name="voice_state_error">Voice conversation stopped by an error</string>
+    <string name="voice_status_label_idle">IDLE</string>
+    <string name="voice_status_label_listening">LISTENING</string>
+    <string name="voice_status_label_thinking">THINKING</string>
+    <string name="voice_status_label_speaking">SPEAKING</string>
+    <string name="voice_status_label_error">ERROR</string>
+    <string name="voice_error_dismiss">Dismiss</string>
+    <string name="voice_mic_mute">Mute microphone</string>
+    <string name="voice_mic_unmute">Unmute microphone</string>
+    <string name="voice_tts_speaker_item">Speaker %1$d</string>
+
+    <!-- Settings / drawer usability copy -->
+    <string name="settings_api_server_off_hint">Server stopped. Turn the switch on to serve requests.</string>
+    <string name="settings_theme_swatch_desc">%1$s theme</string>
+    <string name="drawer_recent_chats">Recent chats</string>
+    <string name="drawer_tools">Tools</string>
 </resources>
