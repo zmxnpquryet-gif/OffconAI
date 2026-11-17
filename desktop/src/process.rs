@@ -156,23 +156,32 @@ pub fn sanitize_path(input: &str) -> String {
     trimmed.to_string()
 }
 
-pub fn log_path(name: &str) -> PathBuf {
+/// Writable per-user application data root. Logs, downloaded models, settings,
+/// and generated images all live under this directory.
+pub fn app_data_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
-    let base = std::env::var_os("LOCALAPPDATA")
-        .filter(|v| !v.is_empty())
-        .map(|v| PathBuf::from(v).join("OffconAI").join("desktop").join("logs"))
-        .unwrap_or_else(|| std::env::temp_dir().join("offcon-desktop"));
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|v| !v.is_empty())
+            .map(|v| PathBuf::from(v).join("OffconAI").join("desktop"))
+            .unwrap_or_else(|| std::env::temp_dir().join("offcon-desktop"))
+    }
     #[cfg(not(target_os = "windows"))]
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .filter(|v| !v.is_empty())
-        .map(|v| PathBuf::from(v).join("offconai-desktop"))
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|v| !v.is_empty())
-                .map(|v| PathBuf::from(v).join(".local").join("state").join("offconai-desktop"))
-        })
-        .unwrap_or_else(|| std::env::temp_dir().join("offcon-desktop"));
-    base.join(name)
+    {
+        std::env::var_os("XDG_DATA_HOME")
+            .filter(|v| !v.is_empty())
+            .map(|v| PathBuf::from(v).join("offconai-desktop"))
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(|v| PathBuf::from(v).join(".local").join("share").join("offconai-desktop"))
+            })
+            .unwrap_or_else(|| std::env::temp_dir().join("offcon-desktop"))
+    }
+}
+
+pub fn log_path(name: &str) -> PathBuf {
+    app_data_dir().join("logs").join(name)
 }
 
 fn open_log(path: &Path) -> Result<File, String> {

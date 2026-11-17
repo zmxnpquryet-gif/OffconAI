@@ -44,6 +44,25 @@ export component StatusDot inherits Rectangle {
     background: root.has-error ? Ui.error : root.active ? Ui.status-live : Ui.muted;
 }
 
+// Flat determinate progress line used for in-app model downloads.
+export component ProgressLine inherits Rectangle {
+    in property <float> progress: 0.0;
+    height: 8px;
+    border-radius: 4px;
+    background: Ui.raised;
+    border-width: 1px;
+    border-color: Ui.hairline;
+
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width * clamp(root.progress, 0, 1);
+        height: parent.height;
+        border-radius: 4px;
+        background: Ui.accent;
+    }
+}
+
 export component SectionLabel inherits Text {
     font-size: 11px;
     font-weight: 400;

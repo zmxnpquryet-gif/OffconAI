@@ -14,6 +14,7 @@ export component ImageWorkspace inherits VerticalLayout {
     in property <bool> image-ready;
 
     callback generate-image-requested();
+    callback test-connection-requested();
 
     spacing: 12px;
     horizontal-stretch: 1;
@@ -28,7 +29,7 @@ export component ImageWorkspace inherits VerticalLayout {
             color: Ui.text;
         }
         Text {
-            text: "Generate a still image through an OpenAI-compatible /v1/images/generations endpoint.";
+            text: "Point at any OpenAI-compatible /v1/images/generations server (e.g. stable-diffusion.cpp \"sd-server\"). Text engines like llama.cpp do not generate images \u{2014} run a small image server next to the app once, then everything here is one click. Images are saved under the app data folder by default.";
             font-size: 12px;
             color: Ui.muted;
             wrap: TextWrap.word-wrap;
@@ -47,14 +48,28 @@ export component ImageWorkspace inherits VerticalLayout {
                 spacing: 8px;
                 width: 46%;
 
-                VerticalLayout {
-                    spacing: 4px;
-                    FieldLabel { text: "Endpoint"; }
-                    Field {
-                        text <=> root.image-endpoint;
-                        placeholder: "http://127.0.0.1:8000";
-                        field-enabled: !root.busy;
-                        monospace: true;
+                HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout {
+                        spacing: 4px;
+                        horizontal-stretch: 1;
+                        FieldLabel { text: "Endpoint"; }
+                        Field {
+                            text <=> root.image-endpoint;
+                            placeholder: "http://127.0.0.1:7860";
+                            field-enabled: !root.busy;
+                            monospace: true;
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 4px;
+                        width: 92px;
+                        FieldLabel { text: " "; }
+                        FlatButton {
+                            label: "Test";
+                            button-enabled: !root.busy;
+                            clicked => { root.test-connection-requested(); }
+                        }
                     }
                 }
                 VerticalLayout {
@@ -86,7 +101,7 @@ export component ImageWorkspace inherits VerticalLayout {
                         FieldLabel { text: "Output path"; }
                         Field {
                             text <=> root.image-output;
-                            placeholder: "build/desktop/generated.png";
+                            placeholder: "auto \u{2192} app data \\images";
                             field-enabled: !root.busy;
                             monospace: true;
                         }
@@ -149,11 +164,12 @@ export component ImageWorkspace inherits VerticalLayout {
                 if !root.image-ready : Text {
                     width: 100%;
                     height: 100%;
-                    text: "Generated image preview appears here.";
+                    text: "Generated image preview appears here.\n\n1. Start an OpenAI-compatible image server\n2. Paste its endpoint and press Test\n3. Type a prompt and click Generate image";
                     font-size: 12px;
                     color: Ui.muted;
                     horizontal-alignment: center;
                     vertical-alignment: center;
+                    wrap: TextWrap.word-wrap;
                 }
             }
         }

@@ -3310,7 +3310,7 @@ dependencies = [
 
 [[package]]
 name = "offcon-desktop"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "base64 0.22.1",
  "reqwest",

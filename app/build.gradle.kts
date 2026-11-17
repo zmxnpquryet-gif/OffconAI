@@ -116,8 +116,8 @@ android {
     applicationId = "com.localllm.android"
     minSdk = 24
     targetSdk = 36
-    versionCode = 24
-    versionName = "2.1.1"
+    versionCode = 25
+    versionName = "2.2.0"
     ndk { abiFilters.addAll(listOf("arm64-v8a", "x86_64")) }
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -198,7 +198,7 @@ dependencies {
   implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
-  // On-device speech recognition (sherpa-onnx, official AAR — no Maven artifact exists)
+  // On-device speech recognition (sherpa-onnx, official AAR ??no Maven artifact exists)
   implementation(files("libs/sherpa-onnx.aar"))
   implementation(libs.okhttp)
   testImplementation(libs.androidx.core)
@@ -215,7 +215,7 @@ configurations.all {
   // No stdlib pinning: the stdlib is backward compatible, so letting it float to
   // what transitive deps resolve is the safe direction. Pinning it DOWN to the
   // compiler version (the old force block did exactly that) is the dangerous
-  // direction — a library built against a newer stdlib can call APIs the old
+  // direction ??a library built against a newer stdlib can call APIs the old
   // stdlib jar does not have (NoSuchMethodError at runtime). If the build ever
   // goes green only with a pin, pin UP to the resolved version, never down.
   // (Verified: builds + unit tests green without any force.)
@@ -223,7 +223,7 @@ configurations.all {
 
 tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
   // REQUIRED, not a shortcut: bundled AARs can ship newer Kotlin metadata than
-  // this module's compiler — litertlm is compiled with Kotlin 2.4 metadata.
+  // this module's compiler ??litertlm is compiled with Kotlin 2.4 metadata.
   // Without this flag the compiler rejects those classes outright.
   compilerOptions.freeCompilerArgs.add("-Xskip-metadata-version-check")
 }

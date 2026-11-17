@@ -1,16 +1,22 @@
 //! Slint UI orchestration controller.
 //! All blocking HTTP/process/MCP I/O executes on worker threads; the Slint event loop
 //! drains typed `UiEvent`s and coordinates multi-round MCP tool execution with user approval.
+//!
+//! The controller also owns the built-in model catalog: selection, in-app HF download
+//! with progress, and load-then-go chaining so a fresh install is truly one click.
 
 use crate::backends::{LlamaCpp, LlamaCppConfig, Strata, StrataConfig, Vllm, VllmConfig};
+use crate::catalog::{self, CatalogModel};
 use crate::contracts::{
     BackendKind, ChatRequest, ImageGenerationBackend, ImageRequest, LlmBackend, ModelSpec,
     StreamEvent, ToolCallRecord,
 };
 use crate::image_backend::OpenAiImageBackend;
 use crate::mcp::{McpCallOutcome, McpClient, McpConnectionInfo};
+use crate::persist::{load_settings, save_settings, Settings};
 use crate::process::{
-    format_resources, parse_command, parse_f64_clamped, parse_port, parse_u32, parse_u32_clamped,
+    app_data_dir, format_bytes, format_resources, parse_command, parse_f64_clamped, parse_port,
+    parse_u32, parse_u32_clamped, sanitize_path,
 };
 use crate::session::{ConversationSession, TurnEntry};
 use crate::{ChatTurn, MainWindow};
@@ -44,6 +50,24 @@ impl BackendChoice {
     }
 }
 
+/// One row of the model picker for the active engine.
+#[derive(Clone)]
+enum CatalogEntry {
+    Catalog(&'static CatalogModel),
+    Local { label: String, path: String },
+    Gateway,
+}
+
+impl CatalogEntry {
+    fn label(&self, installed: bool) -> String {
+        match self {
+            Self::Catalog(model) => model.list_label(installed),
+            Self::Local { label, .. } => format!("{label}  \u{2713} local"),
+            Self::Gateway => "Gateway-managed model".to_string(),
+        }
+    }
+}
+
 enum UiEvent {
     Loaded {
         backend: Arc<dyn LlmBackend>,
@@ -73,6 +97,23 @@ enum UiEvent {
         message: String,
     },
     ImageFailed(String),
+    ImageTestDone {
+        ok: bool,
+        message: String,
+    },
+    DownloadProgress {
+        received: u64,
+        total: u64,
+        display: String,
+    },
+    DownloadDone {
+        path: PathBuf,
+        display: String,
+    },
+    DownloadFailed {
+        display: String,
+        message: String,
+    },
 }
 
 fn to_chat_turn(entry: TurnEntry) -> ChatTurn {
@@ -96,6 +137,11 @@ pub struct DesktopController {
     current_tool_round: u32,
     busy: bool,
     resource_ticks: u32,
+    catalog: Vec<CatalogEntry>,
+    catalog_key: String,
+    auto_label: String,
+    downloading: bool,
+    pending_auto_load: bool,
 }
 
 impl DesktopController {
@@ -114,6 +160,11 @@ impl DesktopController {
             current_tool_round: 0,
             busy: false,
             resource_ticks: 0,
+            catalog: Vec::new(),
+            catalog_key: String::new(),
+            auto_label: String::new(),
+            downloading: false,
+            pending_auto_load: false,
         }
     }
 
@@ -151,6 +202,7 @@ impl DesktopController {
                 ui.set_status(status.into());
                 ui.set_status_error(false);
                 self.refresh_resources();
+                self.save_now(&ui);
             }
             UiEvent::LoadFailed(message) => {
                 self.backend = None;
@@ -169,6 +221,7 @@ impl DesktopController {
                 ui.set_resources("No runtime resources".into());
                 ui.set_status("Runtime unloaded.".into());
                 ui.set_status_error(false);
+                self.save_now(&ui);
             }
             UiEvent::McpConnected(info) => {
                 self.set_busy(&ui, false);
@@ -274,6 +327,7 @@ impl DesktopController {
             }
             UiEvent::ImageWritten { path, message } => {
                 self.set_busy(&ui, false);
+                self.save_now(&ui);
                 match slint::Image::load_from_path(&path) {
                     Ok(image) => {
                         ui.set_image_preview(image);
@@ -290,6 +344,64 @@ impl DesktopController {
             UiEvent::ImageFailed(message) => {
                 self.set_busy(&ui, false);
                 ui.set_status(format!("Image generation failed: {message}").into());
+                ui.set_status_error(true);
+            }
+            UiEvent::ImageTestDone { ok, message } => {
+                self.set_busy(&ui, false);
+                ui.set_status(message.clone().into());
+                ui.set_status_error(!ok);
+                self.save_now(&ui);
+            }
+            UiEvent::DownloadProgress {
+                received,
+                total,
+                display,
+            } => {
+                let ratio = if total > 0 {
+                    (received as f32 / total as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                ui.set_download_active(true);
+                ui.set_download_progress(ratio);
+                ui.set_download_status(
+                    format!(
+                        "Downloading {} \u{00B7} {} / {} ({:.0}%)",
+                        display,
+                        format_bytes(received),
+                        format_bytes(total),
+                        ratio * 100.0
+                    )
+                    .into(),
+                );
+                ui.set_status(format!("Downloading {display}...").into());
+                ui.set_status_error(false);
+            }
+            UiEvent::DownloadDone { path, display } => {
+                self.downloading = false;
+                ui.set_download_active(false);
+                self.refresh_catalog(&ui);
+                self.save_now(&ui);
+                if self.pending_auto_load {
+                    self.pending_auto_load = false;
+                    ui.set_status(
+                        format!("Downloaded {display} \u{2014} starting the engine...").into(),
+                    );
+                    self.load_model();
+                } else {
+                    self.set_busy(&ui, false);
+                    ui.set_status(
+                        format!("Model downloaded: {}", path.display()).into(),
+                    );
+                    ui.set_status_error(false);
+                }
+            }
+            UiEvent::DownloadFailed { display, message } => {
+                self.downloading = false;
+                self.pending_auto_load = false;
+                ui.set_download_active(false);
+                self.set_busy(&ui, false);
+                ui.set_status(format!("Download of {display} failed: {message}").into());
                 ui.set_status_error(true);
             }
         }
@@ -433,11 +545,353 @@ impl DesktopController {
         ui.set_status_error(false);
     }
 
-    fn load_model(&mut self) {
+    // ----- catalog & settings -------------------------------------------------
+
+    fn selected_entry(&self, ui: &MainWindow) -> Option<CatalogEntry> {
+        let index = ui.get_catalog_index() as usize;
+        self.catalog.get(index).cloned()
+    }
+
+    fn refresh_catalog(&mut self, ui: &MainWindow) {
+        let kind = BackendKind::from_index(ui.get_backend_index());
+        let mut entries: Vec<CatalogEntry> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        match kind {
+            BackendKind::LlamaCpp => {
+                for model in catalog::models() {
+                    let installed = catalog::is_installed(model);
+                    labels.push(model.list_label(installed));
+                    entries.push(CatalogEntry::Catalog(model));
+                }
+                for (name, path) in catalog::extra_local_models() {
+                    labels.push(CatalogEntry::Local {
+                        label: name.clone(),
+                        path: path.clone(),
+                    }
+                    .label(true));
+                    entries.push(CatalogEntry::Local { label: name, path });
+                }
+                let restored = if !self.catalog_key.is_empty() {
+                    catalog::find_by_key(&self.catalog_key).and_then(|model| {
+                        entries
+                            .iter()
+                            .position(|entry| matches!(entry, CatalogEntry::Catalog(m) if std::ptr::eq(*m, model)))
+                    })
+                } else {
+                    None
+                };
+                ui.set_catalog_index(restored.map(|i| i as i32).unwrap_or(0));
+            }
+            BackendKind::Vllm => {
+                let current = ui.get_vllm_model_path().to_string();
+                for model in catalog::models() {
+                    labels.push(model.display.to_string());
+                    entries.push(CatalogEntry::Catalog(model));
+                }
+                if !current.trim().is_empty()
+                    && !catalog::models().iter().any(|model| model.repo == current.trim())
+                {
+                    labels.insert(0, format!("{current}  (current)"));
+                    entries.insert(0, CatalogEntry::Local { label: current.clone(), path: current });
+                }
+                let restored = entries.iter().position(|entry| match entry {
+                    CatalogEntry::Local { path, .. } => *path == ui.get_vllm_model_path().to_string(),
+                    _ => false,
+                });
+                ui.set_catalog_index(restored.map(|i| i as i32).unwrap_or(0));
+            }
+            BackendKind::Strata => {
+                labels.push("Gateway-managed model".to_string());
+                entries.push(CatalogEntry::Gateway);
+                ui.set_catalog_index(0);
+            }
+        }
+        self.catalog = entries;
+        ui.set_catalog_labels(ModelRc::new(VecModel::from(
+            labels
+                .into_iter()
+                .map(slint::SharedString::from)
+                .collect::<Vec<_>>(),
+        )));
+        self.sync_catalog_detail(ui);
+    }
+
+    fn sync_catalog_detail(&mut self, ui: &MainWindow) {
+        let note = match self.selected_entry(ui) {
+            Some(CatalogEntry::Catalog(model)) => {
+                format!("{} \u{00B7} {}", model.note_text(), model.note)
+            }
+            Some(CatalogEntry::Local { path, .. }) => {
+                let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                format!("local file \u{00B7} {}", format_bytes(size))
+            }
+            Some(CatalogEntry::Gateway) | None => {
+                catalog::engine_guide(BackendKind::from_index(ui.get_backend_index()))
+                    .recommendation
+                    .to_string()
+            }
+        };
+        ui.set_catalog_note(note.into());
+
+        // Auto-derive the served model label unless the user typed their own.
+        let auto = match self.selected_entry(ui) {
+            Some(CatalogEntry::Catalog(model)) => model.display.to_string(),
+            Some(CatalogEntry::Local { label, .. }) => label
+                .trim_end_matches(".gguf")
+                .to_string(),
+            _ => String::new(),
+        };
+        let current = ui.get_model_label().to_string();
+        if !auto.is_empty() && (current.trim().is_empty() || current == self.auto_label) {
+            ui.set_model_label(auto.clone().into());
+        }
+        if !auto.is_empty() {
+            self.auto_label = auto;
+        }
+
+        // Auto-tune the context window for catalog models (Advanced keeps control).
+        if let Some(CatalogEntry::Catalog(model)) = self.selected_entry(ui) {
+            if BackendKind::from_index(ui.get_backend_index()) == BackendKind::LlamaCpp {
+                ui.set_llama_context_size(model.context.to_string().into());
+            }
+        }
+    }
+
+    fn set_engine_info(&self, ui: &MainWindow) {
+        let guide = catalog::engine_guide(BackendKind::from_index(ui.get_backend_index()));
+        ui.set_engine_info(
+            format!("{}\n\n{}\n\n{}", guide.tagline, guide.strengths, guide.recommendation).into(),
+        );
+    }
+
+    fn backend_changed(&mut self) {
         let Some(ui) = self.ui.upgrade() else { return };
-        if self.busy {
+        let kind = BackendKind::from_index(ui.get_backend_index());
+        if self.backend.is_none() {
+            ui.set_empty_engine(idle_engine_label(kind).into());
+        }
+        self.set_engine_info(&ui);
+        self.refresh_catalog(&ui);
+        ui.set_status(
+            format!(
+                "{} selected. Pick a model and press Load.",
+                kind.label()
+            )
+            .into(),
+        );
+        ui.set_status_error(false);
+        self.save_now(&ui);
+    }
+
+    fn catalog_selected(&mut self, _index: i32) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let kind = BackendKind::from_index(ui.get_backend_index());
+        if kind == BackendKind::Vllm {
+            if let Some(CatalogEntry::Catalog(model)) = self.selected_entry(&ui) {
+                ui.set_vllm_model_path(model.repo.into());
+            }
+        }
+        if let Some(CatalogEntry::Catalog(model)) = self.selected_entry(&ui) {
+            self.catalog_key = model.key();
+        }
+        self.sync_catalog_detail(&ui);
+        self.save_now(&ui);
+    }
+
+    fn advanced_toggled(&mut self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        ui.set_advanced_open(!ui.get_advanced_open());
+        self.save_now(&ui);
+    }
+
+    fn snapshot_settings(&self, ui: &MainWindow) -> Settings {
+        let catalog_key = match self.selected_entry(ui) {
+            Some(CatalogEntry::Catalog(model)) => model.key(),
+            _ => String::new(),
+        };
+        Settings {
+            version: crate::persist::SETTINGS_VERSION,
+            edition_index: ui.get_edition_index(),
+            backend_index: ui.get_backend_index(),
+            catalog_key,
+            use_manual_model: ui.get_use_manual_model(),
+            model_label: ui.get_model_label().to_string(),
+            llama_executable: ui.get_llama_executable().to_string(),
+            llama_model_path: ui.get_llama_model_path().to_string(),
+            llama_port: ui.get_llama_port().to_string(),
+            llama_context_size: ui.get_llama_context_size().to_string(),
+            llama_gpu_layers: ui.get_llama_gpu_layers().to_string(),
+            vllm_endpoint: ui.get_vllm_endpoint().to_string(),
+            vllm_model_path: ui.get_vllm_model_path().to_string(),
+            vllm_port: ui.get_vllm_port().to_string(),
+            vllm_managed: ui.get_vllm_managed(),
+            strata_endpoint: ui.get_strata_endpoint().to_string(),
+            strata_launch: ui.get_strata_launch().to_string(),
+            temperature_text: ui.get_temperature_text().to_string(),
+            max_tokens_text: ui.get_max_tokens_text().to_string(),
+            mcp_url: ui.get_mcp_url().to_string(),
+            image_endpoint: ui.get_image_endpoint().to_string(),
+            image_model: ui.get_image_model().to_string(),
+            image_size: ui.get_image_size().to_string(),
+            image_output: ui.get_image_output().to_string(),
+        }
+    }
+
+    fn apply_settings(&mut self, settings: Settings) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        self.catalog_key = settings.catalog_key.clone();
+        ui.set_edition_index(settings.edition_index);
+        if settings.edition_index == 0 && ui.get_tab_index() == 1 {
+            ui.set_tab_index(0);
+        }
+        ui.set_backend_index(settings.backend_index);
+        ui.set_model_label(settings.model_label.clone().into());
+        if !settings.model_label.is_empty() {
+            self.auto_label = settings.model_label.clone();
+        }
+        ui.set_llama_executable(
+            if settings.llama_executable.is_empty() {
+                "llama-server".to_string()
+            } else {
+                settings.llama_executable.clone()
+            }
+            .into(),
+        );
+        ui.set_llama_model_path(settings.llama_model_path.clone().into());
+        ui.set_llama_port(
+            if settings.llama_port.is_empty() {
+                "8080".to_string()
+            } else {
+                settings.llama_port.clone()
+            }
+            .into(),
+        );
+        ui.set_llama_context_size(
+            if settings.llama_context_size.is_empty() {
+                "4096".to_string()
+            } else {
+                settings.llama_context_size.clone()
+            }
+            .into(),
+        );
+        ui.set_llama_gpu_layers(
+            if settings.llama_gpu_layers.is_empty() {
+                "0".to_string()
+            } else {
+                settings.llama_gpu_layers.clone()
+            }
+            .into(),
+        );
+        ui.set_vllm_endpoint(settings.vllm_endpoint.clone().into());
+        ui.set_vllm_model_path(settings.vllm_model_path.clone().into());
+        ui.set_vllm_port(
+            if settings.vllm_port.is_empty() {
+                "8000".to_string()
+            } else {
+                settings.vllm_port.clone()
+            }
+            .into(),
+        );
+        ui.set_vllm_managed(settings.vllm_managed);
+        ui.set_strata_endpoint(settings.strata_endpoint.clone().into());
+        ui.set_strata_launch(settings.strata_launch.clone().into());
+        ui.set_temperature_text(
+            if settings.temperature_text.is_empty() {
+                "0.7".to_string()
+            } else {
+                settings.temperature_text.clone()
+            }
+            .into(),
+        );
+        ui.set_max_tokens_text(
+            if settings.max_tokens_text.is_empty() {
+                "1024".to_string()
+            } else {
+                settings.max_tokens_text.clone()
+            }
+            .into(),
+        );
+        ui.set_mcp_url(settings.mcp_url.clone().into());
+        ui.set_image_endpoint(settings.image_endpoint.clone().into());
+        ui.set_image_model(settings.image_model.clone().into());
+        ui.set_image_size(
+            if settings.image_size.is_empty() {
+                "1024x1024".to_string()
+            } else {
+                settings.image_size.clone()
+            }
+            .into(),
+        );
+        ui.set_image_output(settings.image_output.clone().into());
+        ui.set_use_manual_model(settings.use_manual_model);
+
+        self.set_engine_info(&ui);
+        self.refresh_catalog(&ui);
+    }
+
+    fn save_now(&self, ui: &MainWindow) {
+        let settings = self.snapshot_settings(ui);
+        let _ = save_settings(&settings);
+    }
+
+    // ----- model load / download ----------------------------------------------
+
+    fn llama_model_source(&self, ui: &MainWindow) -> Result<String, Option<&'static CatalogModel>> {
+        if ui.get_use_manual_model() {
+            return Ok(ui.get_llama_model_path().to_string());
+        }
+        match self.selected_entry(ui) {
+            Some(CatalogEntry::Catalog(model)) => match catalog::installed_path(model) {
+                Some(path) => Ok(path.to_string_lossy().to_string()),
+                None => Err(Some(model)),
+            },
+            Some(CatalogEntry::Local { path, .. }) => Ok(path),
+            _ => Ok(ui.get_llama_model_path().to_string()),
+        }
+    }
+
+    fn maybe_auto_restore(&mut self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        if BackendKind::from_index(ui.get_backend_index()) != BackendKind::LlamaCpp {
             return;
         }
+        match self.llama_model_source(&ui) {
+            Ok(path) if !path.trim().is_empty() && PathBuf::from(sanitize_path(&path)).is_file() => {
+                ui.set_status("Restoring your last session...".into());
+                self.load_model();
+            }
+            _ => {
+                ui.set_status(
+                    "Pick a model from the list and press Load \u{2014} it downloads and starts in one click."
+                        .into(),
+                );
+            }
+        }
+    }
+
+    fn load_model(&mut self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        if self.busy || self.downloading {
+            return;
+        }
+        let kind = BackendKind::from_index(ui.get_backend_index());
+
+        if kind == BackendKind::LlamaCpp {
+            match self.llama_model_source(&ui) {
+                Ok(path) if !path.trim().is_empty() => {}
+                Ok(_) => {
+                    ui.set_status("Pick a model from the list first.".into());
+                    ui.set_status_error(true);
+                    return;
+                }
+                Err(Some(model)) => {
+                    self.start_download(model, true);
+                    return;
+                }
+                Err(None) => {}
+            }
+        }
+
         let choice = self.backend_choice(&ui);
         let raw_label = ui.get_model_label().to_string();
         let model_label = if raw_label.trim().is_empty() {
@@ -445,8 +899,8 @@ impl DesktopController {
         } else {
             raw_label.trim().to_string()
         };
-        let local_path = match BackendKind::from_index(ui.get_backend_index()) {
-            BackendKind::LlamaCpp => Some(ui.get_llama_model_path().to_string()),
+        let local_path = match kind {
+            BackendKind::LlamaCpp => Some(self.llama_model_source(&ui).unwrap_or_default()),
             BackendKind::Vllm => Some(ui.get_vllm_model_path().to_string()),
             BackendKind::Strata => None,
         };
@@ -454,7 +908,7 @@ impl DesktopController {
         let previous = self.backend.take();
         let sender = self.sender.clone();
         self.set_busy(&ui, true);
-        ui.set_status("Loading backend...".into());
+        ui.set_status("Loading engine...".into());
         ui.set_status_error(false);
         thread::spawn(move || {
             if let Some(previous) = previous {
@@ -483,6 +937,54 @@ impl DesktopController {
         });
     }
 
+    fn start_download(&mut self, model: &'static CatalogModel, auto_load: bool) {
+        if self.downloading {
+            return;
+        }
+        let Some(ui) = self.ui.upgrade() else { return };
+        if let Err(error) = catalog::ensure_models_dir() {
+            ui.set_status(error.into());
+            ui.set_status_error(true);
+            return;
+        }
+        self.downloading = true;
+        self.pending_auto_load = auto_load;
+        self.set_busy(&ui, true);
+        ui.set_download_active(true);
+        ui.set_download_progress(0.0);
+        ui.set_download_status(
+            format!("Downloading {} \u{00B7} {}", model.display, model.size_label()).into(),
+        );
+        ui.set_status(format!("Downloading {} from Hugging Face...", model.display).into());
+        ui.set_status_error(false);
+
+        let sender = self.sender.clone();
+        let url = model.download_url();
+        let target = catalog::models_dir().join(model.file);
+        let display = model.display.to_string();
+        let expected = model.size_bytes;
+        thread::spawn(move || {
+            let progress_sender = sender.clone();
+            let progress_display = display.clone();
+            let mut progress = move |received: u64, total: u64| {
+                let _ = progress_sender.send(UiEvent::DownloadProgress {
+                    received,
+                    total,
+                    display: progress_display.clone(),
+                });
+            };
+            let outcome = catalog::download_with_progress(&url, &target, expected, &mut progress);
+            match outcome {
+                Ok(path) => {
+                    let _ = sender.send(UiEvent::DownloadDone { path, display });
+                }
+                Err(message) => {
+                    let _ = sender.send(UiEvent::DownloadFailed { display, message });
+                }
+            }
+        });
+    }
+
     fn unload_model(&mut self) {
         let Some(ui) = self.ui.upgrade() else { return };
         if self.busy {
@@ -499,22 +1001,6 @@ impl DesktopController {
             }
             let _ = sender.send(UiEvent::Unloaded);
         });
-    }
-
-    fn backend_changed(&mut self) {
-        let Some(ui) = self.ui.upgrade() else { return };
-        let kind = BackendKind::from_index(ui.get_backend_index());
-        if self.backend.is_none() {
-            ui.set_empty_engine(idle_engine_label(kind).into());
-        }
-        ui.set_status(
-            format!(
-                "{} selected. Configure settings and load or connect.",
-                kind.label()
-            )
-            .into(),
-        );
-        ui.set_status_error(false);
     }
 
     fn backend_choice(&self, ui: &MainWindow) -> BackendChoice {
@@ -553,7 +1039,7 @@ impl DesktopController {
             return;
         }
         let Some(backend) = self.backend.clone() else {
-            ui.set_status("Load or connect a backend first.".into());
+            ui.set_status("Press Load first \u{2014} it downloads and starts the model for you.".into());
             ui.set_status_error(true);
             return;
         };
@@ -635,6 +1121,19 @@ impl DesktopController {
             ui.set_status_error(true);
             return;
         }
+        let mut output = ui.get_image_output().to_string();
+        if output.trim().is_empty() {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            output = app_data_dir()
+                .join("images")
+                .join(format!("offcon-image-{stamp}.png"))
+                .to_string_lossy()
+                .to_string();
+            ui.set_image_output(output.clone().into());
+        }
         let backend = OpenAiImageBackend::new(
             ui.get_image_endpoint().to_string(),
             std::env::var("IMAGE_API_KEY").ok(),
@@ -645,7 +1144,7 @@ impl DesktopController {
             size: ui.get_image_size().to_string(),
             output_format: "png".into(),
         };
-        let output = PathBuf::from(ui.get_image_output().to_string());
+        let output = PathBuf::from(output);
         let sender = self.sender.clone();
         self.set_busy(&ui, true);
         ui.set_status("Generating image...".into());
@@ -682,6 +1181,74 @@ impl DesktopController {
         });
     }
 
+    fn test_image_endpoint(&mut self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        if self.busy {
+            return;
+        }
+        let endpoint = ui.get_image_endpoint().to_string();
+        if endpoint.trim().is_empty() {
+            ui.set_status("Enter an image endpoint first, then press Test.".into());
+            ui.set_status_error(true);
+            return;
+        }
+        let sender = self.sender.clone();
+        self.set_busy(&ui, true);
+        ui.set_status("Testing image endpoint...".into());
+        ui.set_status_error(false);
+        thread::spawn(move || {
+            let base = endpoint.trim().trim_end_matches('/').to_string();
+            let url = if base.ends_with("/v1") {
+                format!("{base}/models")
+            } else {
+                format!("{base}/v1/models")
+            };
+            let outcome = (|| -> Result<usize, String> {
+                let client = reqwest::blocking::Client::builder()
+                    .connect_timeout(Duration::from_secs(8))
+                    .timeout(Duration::from_secs(12))
+                    .build()
+                    .map_err(|error| format!("HTTP client error: {error}"))?;
+                let response = client
+                    .get(&url)
+                    .send()
+                    .map_err(|error| format!("unreachable: {error}"))?;
+                let status = response.status();
+                let text = response
+                    .text()
+                    .map_err(|error| format!("unreadable response: {error}"))?;
+                if !status.is_success() {
+                    return Err(format!("HTTP {status}"));
+                }
+                let count = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("data")
+                            .and_then(|data| data.as_array())
+                            .map(|items| items.len())
+                    })
+                    .unwrap_or(0);
+                Ok(count)
+            })();
+            let event = match outcome {
+                Ok(count) if count > 0 => UiEvent::ImageTestDone {
+                    ok: true,
+                    message: format!("Image endpoint reachable \u{00B7} {count} models listed"),
+                },
+                Ok(_) => UiEvent::ImageTestDone {
+                    ok: true,
+                    message: "Image endpoint reachable".to_string(),
+                },
+                Err(message) => UiEvent::ImageTestDone {
+                    ok: false,
+                    message: format!("Image endpoint failed: {message}"),
+                },
+            };
+            let _ = sender.send(event);
+        });
+    }
+
     fn refresh_resources(&mut self) {
         let Some(ui) = self.ui.upgrade() else { return };
         let Some(backend) = self.backend.as_ref() else {
@@ -699,6 +1266,9 @@ impl DesktopController {
         self.mcp.disconnect();
         if let Some(backend) = self.backend.take() {
             backend.unload();
+        }
+        if let Some(ui) = self.ui.upgrade() {
+            self.save_now(&ui);
         }
     }
 }
@@ -719,6 +1289,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
     let ui = MainWindow::new()?;
     let controller = Rc::new(RefCell::new(DesktopController::new(ui.as_weak())));
     controller.borrow().install();
+    controller.borrow_mut().apply_settings(load_settings());
+    {
+        let ui_ref = &ui;
+        controller.borrow().save_now(ui_ref);
+    }
 
     macro_rules! wire {
         ($method:ident, $action:ident) => {{
@@ -726,6 +1301,14 @@ pub fn run() -> Result<(), slint::PlatformError> {
             ui.$method(move || {
                 if let Some(ctrl) = weak.upgrade() {
                     ctrl.borrow_mut().$action();
+                }
+            });
+        }};
+        ($method:ident, $action:ident, arg) => {{
+            let weak = Rc::downgrade(&controller);
+            ui.$method(move |arg| {
+                if let Some(ctrl) = weak.upgrade() {
+                    ctrl.borrow_mut().$action(arg);
                 }
             });
         }};
@@ -737,7 +1320,10 @@ pub fn run() -> Result<(), slint::PlatformError> {
     wire!(on_send_requested, send_message);
     wire!(on_stop_requested, stop_generation);
     wire!(on_generate_image_requested, generate_image);
+    wire!(on_image_test_requested, test_image_endpoint);
     wire!(on_backend_changed, backend_changed);
+    wire!(on_catalog_selected, catalog_selected, arg);
+    wire!(on_advanced_toggled, advanced_toggled);
     wire!(on_mcp_connect_requested, connect_mcp);
     wire!(on_mcp_disconnect_requested, disconnect_mcp);
     wire!(on_approve_tool_requested, approve_pending_tool);
@@ -756,6 +1342,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
             },
         );
     }
+
+    controller.borrow_mut().maybe_auto_restore();
 
     let result = ui.run();
     drop(timer);

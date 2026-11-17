@@ -25,11 +25,22 @@ export component MainWindow inherits Window {
 
     in-out property <bool> busy: false;
     in-out property <bool> model-loaded: false;
-    in-out property <string> status: "Select a backend and load or connect a model.";
+    in-out property <string> status: "Pick a model and press Load \u{2014} the engine and download are handled for you.";
     in-out property <bool> status-error: false;
     in-out property <string> model-indicator: "No model";
     in-out property <string> resources: "No runtime resources";
     in-out property <string> empty-engine: "llama.cpp \u{00B7} local runtime";
+
+    in-out property <string> engine-info: "";
+    in-out property <[string]> catalog-labels: [];
+    in-out property <int> catalog-index: 0;
+    in-out property <string> catalog-note: "";
+    in-out property <bool> download-active: false;
+    in-out property <float> download-progress: 0.0;
+    in-out property <string> download-status: "";
+
+    in-out property <bool> advanced-open: false;
+    in-out property <bool> use-manual-model: false;
 
     in-out property <[ChatTurn]> turns: [];
     in-out property <string> input-text: "";
@@ -62,11 +73,11 @@ export component MainWindow inherits Window {
     in-out property <string> temperature-text: "0.7";
     in-out property <string> max-tokens-text: "1024";
 
-    in-out property <string> image-endpoint: "http://127.0.0.1:8000";
+    in-out property <string> image-endpoint: "";
     in-out property <string> image-model: "";
     in-out property <string> image-size: "1024x1024";
     in-out property <string> image-prompt: "";
-    in-out property <string> image-output: "build/desktop/generated.png";
+    in-out property <string> image-output: "";
     in-out property <image> image-preview;
     in-out property <bool> image-ready: false;
 
@@ -76,7 +87,10 @@ export component MainWindow inherits Window {
     callback send-requested();
     callback stop-requested();
     callback generate-image-requested();
+    callback image-test-requested();
     callback backend-changed();
+    callback catalog-selected(int);
+    callback advanced-toggled();
     callback mcp-connect-requested();
     callback mcp-disconnect-requested();
     callback approve-tool-requested();
@@ -85,7 +99,6 @@ export component MainWindow inherits Window {
     property <bool> image-edition: edition-index == 1;
     property <bool> chat-tab: tab-index == 0;
     property <string> edition-name: edition-index == 1 ? "All-in-One" : "LLM";
-    property <string> backend-name: backend-index == 0 ? "llama.cpp" : backend-index == 1 ? "vLLM" : "Strata";
     property <string> endpoint-name: backend-index == 0 ? "local process" : "OpenAI-compatible endpoint";
 
     VerticalLayout {
@@ -150,26 +163,6 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                Text {
-                    text: "Backend";
-                    font-size: 11px;
-                    color: Ui.muted;
-                    vertical-alignment: center;
-                }
-                Rectangle {
-                    width: 116px;
-                    background: transparent;
-                    SelectChip {
-                        y: (parent.height - self.height) / 2;
-                        chip-width: 116px;
-                        value: root.backend-name;
-                        activated => {
-                            root.backend-index = root.backend-index == 2 ? 0 : root.backend-index + 1;
-                            root.backend-changed();
-                        }
-                    }
-                }
-
                 Rectangle {
                     width: 68px;
                     background: transparent;
@@ -200,11 +193,21 @@ export component MainWindow inherits Window {
             spacing: 20px;
 
             RuntimeSidebar {
-                backend-index: root.backend-index;
+                backend-index <=> root.backend-index;
                 busy: root.busy;
                 model-loaded: root.model-loaded;
                 mcp-connected: root.mcp-connected;
                 mcp-status: root.mcp-status;
+
+                engine-info: root.engine-info;
+                catalog-labels: root.catalog-labels;
+                catalog-index <=> root.catalog-index;
+                catalog-note: root.catalog-note;
+                download-active: root.download-active;
+                download-progress: root.download-progress;
+                download-status: root.download-status;
+                advanced-open <=> root.advanced-open;
+                use-manual-model <=> root.use-manual-model;
 
                 model-label <=> root.model-label;
                 llama-executable <=> root.llama-executable;
@@ -230,6 +233,9 @@ export component MainWindow inherits Window {
                 load-requested => { root.load-requested(); }
                 unload-requested => { root.unload-requested(); }
                 new-chat-requested => { root.new-chat-requested(); }
+                engine-changed => { root.backend-changed(); }
+                catalog-selected(index) => { root.catalog-selected(index); }
+                advanced-toggled => { root.advanced-toggled(); }
                 mcp-connect-requested => { root.mcp-connect-requested(); }
                 mcp-disconnect-requested => { root.mcp-disconnect-requested(); }
             }
@@ -286,6 +292,7 @@ export component MainWindow inherits Window {
                     image-ready: root.image-ready;
 
                     generate-image-requested => { root.generate-image-requested(); }
+                    test-connection-requested => { root.image-test-requested(); }
                 }
             }
         }

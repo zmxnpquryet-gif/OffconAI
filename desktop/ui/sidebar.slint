@@ -1,15 +1,26 @@
-// OffconAI Desktop — 300px runtime, backend, sampling & MCP tools sidebar.
+// OffconAI Desktop — runtime, engine guide, model catalog & MCP tools sidebar.
 
-import { ScrollView } from "std-widgets.slint";
+import { ComboBox, ScrollView } from "std-widgets.slint";
 import { Ui } from "theme.slint";
-import { Card, CheckRow, Field, FieldLabel, FlatButton, SectionLabel, StatusDot } from "widgets.slint";
+import { Card, CheckRow, Field, FieldLabel, FlatButton, ProgressLine, SectionLabel, StatusDot } from "widgets.slint";
 
 export component RuntimeSidebar inherits Rectangle {
-    in property <int> backend-index;
+    in-out property <int> backend-index;
     in property <bool> busy;
     in property <bool> model-loaded;
     in property <bool> mcp-connected;
     in property <string> mcp-status;
+
+    in property <string> engine-info;
+    in property <[string]> catalog-labels;
+    in-out property <int> catalog-index;
+    in property <string> catalog-note;
+    in property <bool> download-active;
+    in property <float> download-progress;
+    in property <string> download-status;
+
+    in property <bool> advanced-open;
+    in-out property <bool> use-manual-model;
 
     in-out property <string> model-label;
     in-out property <string> llama-executable;
@@ -35,6 +46,9 @@ export component RuntimeSidebar inherits Rectangle {
     callback load-requested();
     callback unload-requested();
     callback new-chat-requested();
+    callback catalog-selected(int);
+    callback engine-changed();
+    callback advanced-toggled();
     callback mcp-connect-requested();
     callback mcp-disconnect-requested();
 
@@ -60,14 +74,60 @@ export component RuntimeSidebar inherits Rectangle {
                     padding: 12px;
                     spacing: 8px;
 
+                    FieldLabel { text: "Engine"; }
+                    ComboBox {
+                        height: 34px;
+                        model: [
+                            "llama.cpp \u{00B7} zero-setup",
+                            "vLLM \u{00B7} max throughput",
+                            "Strata \u{00B7} gateway",
+                        ];
+                        current-index <=> root.backend-index;
+                        enabled: !root.busy;
+                        selected => {
+                            root.engine-changed();
+                        }
+                    }
+                    Text {
+                        text: root.engine-info;
+                        wrap: TextWrap.word-wrap;
+                        font-size: 11px;
+                        color: Ui.muted;
+                    }
+
                     VerticalLayout {
                         spacing: 4px;
-                        FieldLabel { text: "Model label / served id"; }
-                        Field {
-                            text <=> root.model-label;
-                            placeholder: "local-model";
-                            field-enabled: !root.busy;
-                            monospace: true;
+                        FieldLabel { text: "Model"; }
+                        ComboBox {
+                            height: 34px;
+                            model: root.catalog-labels;
+                            current-index <=> root.catalog-index;
+                            enabled: !root.busy;
+                            selected => {
+                                root.catalog-selected(self.current-index);
+                            }
+                        }
+                    }
+                    Text {
+                        text: root.catalog-note;
+                        wrap: TextWrap.word-wrap;
+                        font-size: 11px;
+                        font-family: Ui.font-mono;
+                        color: Ui.muted;
+                    }
+
+                    if root.download-active : VerticalLayout {
+                        spacing: 4px;
+                        ProgressLine {
+                            height: 8px;
+                            progress: root.download-progress;
+                        }
+                        Text {
+                            text: root.download-status;
+                            font-size: 11px;
+                            font-family: Ui.font-mono;
+                            color: Ui.text;
+                            overflow: elide;
                         }
                     }
 
@@ -76,7 +136,7 @@ export component RuntimeSidebar inherits Rectangle {
                         height: 36px;
 
                         FlatButton {
-                            label: "Load / connect";
+                            label: "Load";
                             primary: true;
                             button-enabled: !root.busy;
                             horizontal-stretch: 1;
@@ -100,23 +160,24 @@ export component RuntimeSidebar inherits Rectangle {
             }
 
             Rectangle { height: 2px; background: transparent; }
-            SectionLabel { text: "Backend"; }
             Card {
                 VerticalLayout {
                     padding: 12px;
                     spacing: 8px;
 
-                    if root.backend-index == 0 : VerticalLayout {
+                    FlatButton {
+                        label: root.advanced-open ? "Hide advanced settings" : "Show advanced settings";
+                        height: 30px;
+                        button-enabled: !root.busy;
+                        clicked => { root.advanced-toggled(); }
+                    }
+
+                    if root.advanced-open && root.backend-index == 0 : VerticalLayout {
                         spacing: 8px;
-                        VerticalLayout {
-                            spacing: 4px;
-                            FieldLabel { text: "llama-server binary"; }
-                            Field {
-                                text <=> root.llama-executable;
-                                placeholder: "llama-server";
-                                field-enabled: !root.busy;
-                                monospace: true;
-                            }
+                        CheckRow {
+                            checked <=> root.use-manual-model;
+                            label: "Use manual GGUF path instead of the list";
+                            row-enabled: !root.busy;
                         }
                         VerticalLayout {
                             spacing: 4px;
@@ -124,6 +185,16 @@ export component RuntimeSidebar inherits Rectangle {
                             Field {
                                 text <=> root.llama-model-path;
                                 placeholder: "C:\\models\\model.gguf";
+                                field-enabled: !root.busy;
+                                monospace: true;
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 4px;
+                            FieldLabel { text: "llama-server binary"; }
+                            Field {
+                                text <=> root.llama-executable;
+                                placeholder: "llama-server (bundled)";
                                 field-enabled: !root.busy;
                                 monospace: true;
                             }
@@ -164,9 +235,19 @@ export component RuntimeSidebar inherits Rectangle {
                                 }
                             }
                         }
+                        VerticalLayout {
+                            spacing: 4px;
+                            FieldLabel { text: "Model label / served id"; }
+                            Field {
+                                text <=> root.model-label;
+                                placeholder: "auto from selection";
+                                field-enabled: !root.busy;
+                                monospace: true;
+                            }
+                        }
                     }
 
-                    if root.backend-index == 1 : VerticalLayout {
+                    if root.advanced-open && root.backend-index == 1 : VerticalLayout {
                         spacing: 8px;
                         VerticalLayout {
                             spacing: 4px;
@@ -183,7 +264,7 @@ export component RuntimeSidebar inherits Rectangle {
                             FieldLabel { text: "Model path / Hugging Face id"; }
                             Field {
                                 text <=> root.vllm-model-path;
-                                placeholder: "Qwen/Qwen3.5-4B-Instruct";
+                                placeholder: "Qwen/Qwen3-8B";
                                 field-enabled: !root.busy;
                                 monospace: true;
                             }
@@ -214,7 +295,7 @@ export component RuntimeSidebar inherits Rectangle {
                         }
                     }
 
-                    if root.backend-index == 2 : VerticalLayout {
+                    if root.advanced-open && root.backend-index == 2 : VerticalLayout {
                         spacing: 8px;
                         VerticalLayout {
                             spacing: 4px;
@@ -235,13 +316,6 @@ export component RuntimeSidebar inherits Rectangle {
                                 field-enabled: !root.busy;
                                 monospace: true;
                             }
-                        }
-                        Text {
-                            width: 100%;
-                            text: "Strata deployments expose release-specific routes; connect an OpenAI-compatible gateway.";
-                            wrap: TextWrap.word-wrap;
-                            font-size: 11px;
-                            color: Ui.muted;
                         }
                     }
                 }

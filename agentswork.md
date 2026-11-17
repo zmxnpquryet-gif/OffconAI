@@ -632,3 +632,25 @@
   - `.\gradlew.bat :desktop:test :desktop:installDist --stacktrace`: BUILD SUCCESSFUL (Rust 단위 테스트 16/16 통과, `desktop/build/install/desktop/bin/offcon-desktop.exe` 16,443,392 bytes + `llama-server.exe` 11,371,008 bytes 확인).
   - `dumpbin /dependents`로 `llama-server.exe`가 `KERNEL32.dll`, `ADVAPI32.dll`, `WS2_32.dll` 외 외부 VC++ 재배포 DLL 의존성 없이 완전 독립 실행 가능함을 확인했고 `--version` 출력(`1.0.0-dev build 400 commit b1b770d`)을 검증했다.
   - `.\gradlew.bat :app:testDebugUnitTest --stacktrace`: BUILD SUCCESSFUL.
+
+## 2026-11-18 — v2.2.0: 데스크탑 원클릭 모델 플로우 (앱 내부 HF 카탈로그 + 엔진 가이드) (main)
+
+- **배경**: 사용자 피드백 — ① "딸깍으로 모든걸 하자"가 모토인데 만질게 너무 많음(모델 라벨/엔진 경로/GGUF 경로/포트/컨텍스트/GPU 레이어 전부 수동 입력), ② 이미지 탭이 디폴트로 동작도 안 하는 장난 수준, ③ 추론 엔진을 바꿀 때 각 엔진의 고유 장점·강점 설명이 없음, ④ "내 앱 안에서 모든 것" 지향 — 모델 경로 직접 입력 대신 앱 안에 HF 카탈로그를 넣고 엔진별 추천 모델을 표시할 것. 직접 경로 추가 기능 자체는 유지.
+- **구현 내용**:
+  - `desktop/src/catalog.rs` (신규): 엔진별 가이드(llama.cpp=제로셋업·CPU/RAM 친화, vLLM=최대 스루풋·VRAM 필요, Strata=매니지드 게이트웨이) + 검증된 HF GGUF 카탈로그 10종(Qwen3 0.6B/1.7B/4B/8B/30B-A3B, Llama 3.2 3B / 3.1 8B, Gemma3 4B, Mistral 7B v0.3, DeepSeek-R1-Distill 7B). 각 항목은 `resolve/main` 리다이렉트 HEAD 요청으로 URL과 실제 바이트 크기(X-Linked-Size)를 확인했고 파라미터/양자화/컨텍스트/tools/reasoning 배지와 엔진 추천(★) 필드를 가진다. `download_with_progress`는 `.part` 임시파일 → 원자적 rename으로 스트리밍 다운로드(32 MiB마다 진행 콜백)하며, 앱 관리 모델 디렉터리는 Windows `%LOCALAPPDATA%\OffconAI\desktop\models` / Linux `~/.local/share/offconai-desktop/models`. 모델 디렉터리에 수동으로 넣은 GGUF도 피커에 자동 표시.
+  - `desktop/src/persist.rs` (신규): 모든 사이드바 선택(엔진/카탈로그 키/수동경로/포트/컨텍스트/GPU/샘플링/MCP/이미지 설정)을 `settings.json`(앱 데이터 디렉터리)에 원자적 저장·복원. 손상 파일은 `.bak`로 격리 후 기본값.
+  - `desktop/src/process.rs`: `app_data_dir()` 공용 헬퍼 추출(로그·모델·설정·이미지가 한 루트를 공유). (핫픽스 v2.1.1의 log_path를 재구성한 것으로, Windows 경로는 동일, Linux는 state→data(XDG_DATA_HOME)로 정규화.)
+  - `desktop/ui/sidebar.slint`: 런타임 카드 개편 — 엔진 ComboBox(태그라인 포함) + 엔진 강점 설명 3~4문장 자동 표시, 모델 카탈로그 ComboBox(설치됨 ✓ 마커) + 능력 노트, 다운로드 진행바(`ProgressLine` 위젯 신규), Load/Unload/New conversation 유지. 수동 GGUF 경로 체크박스·엔진 바이너리·포트·컨텍스트·GPU 레이어·모델 라벨 필드는 전부 "Show/Hide advanced settings" 토글 아래로 축소.
+  - `desktop/ui/app.slint`: 헤더의 Backend 순환 SelectChip 제거(엔진 선택은 사이드바 ComboBox로), 카탈로그/다운로드/고급설정 속성·콜백 추가. 기본 상태 문구를 원클릭 안내로 교체.
+  - `desktop/ui/image.slint`: 엔드포인드 옆 **Test** 버튼 추가(`/v1/models` 도달성 확인), 안내 문구에 "텍스트 엔진(llama.cpp)은 이미지를 생성하지 않음 — OpenAI 호환 이미지 서버(sd-server 등)가 필요" 명시, 출력 경로 기본값을 앱 데이터 `images/` 타임스탬프 파일로 자동화, 빈 상태 3단계 가이드 표시.
+  - `desktop/src/controller.rs`: 설정 복구→저장 사이클, 카탈로그 동기화(선택 키/자동 모델 라벨/컨텍스트 자동 튜닝), **Load 클릭 시 미설치 모델이면 다운로드→완료 즉시 엔진 기동 체인**, 다운로드 진행 이벤트, 이미지 엔드포인트 테스트, 시작 시 마지막 모델 자동 복원. 전송/툴/세션 로직은 v2.1.1 그대로 유지.
+  - 버전: desktop 2.2.0, app versionCode 25 / versionName 2.2.0.
+- **검증**:
+  - `cargo test`: **24/24 통과 + 1 ignored**(기존 16 + 카탈로그 5 + 설정 4), `cargo build` 성공.
+  - 실행 스크린샷 확인: 엔진 가이드/카탈로그 콤보/노트/고급 접힘/상태바 원클릭 안내 정상 렌더링 (折叠 화살표 유니코드 글리프가 박스로 렌더링되어 Show/Hide 텍스트로 대체).
+  - 실다운로드 통합 테스트 `cargo test --release -- --ignored download_streams_and_finalizes`: PASS (11.72s, Qwen3 0.6B 484,220,320 bytes 실제 HF 다운로드 → 크기 검증 → `.part` 정리 확인).
+  - **settings.json UTF-8 BOM 허용 수정**: PowerShell 시드에 `System.Text.Encoding::UTF8`(BOM 있음)을 쓰자 `serde_json`이 파싱 실패해 기본값으로 리셋됨 → `load_settings`에서 선행 `\u{FEFF}` strip 후 파싱하도록 수정 + `utf8_bom_is_tolerated` 테스트 추가(24개째).
+  - **카탈로그 컨텍스트 축소(10종 전부 40,960 → 8,192)**: 0.6B 모델 자동 복원 후 텔레메트리에서 `mem 5.1 GiB` 확인 — 40,960 컨텍스트의 KV 캐시가 전부 선할당되는 구조라 CPU 모드에서 RAM 낭비가 컸음. 고급 설정에서 직접 늘릴 수 있고 기본값만 데스크톱 실용 크기로 조정.
+  - **E2E 채팅 검증**: settings.json(카탈로그 키 0.6B) 시드 → 앱 기동 → 자동 복원으로 번들 `llama-server` 기동(healthy, pid 28960 표시, "✓ installed" 마커) → "hello, say hi in korean" 입력 → reasoning 스트리밍 + 최종 응답 "안녕하세요! 😊" 확인.
+  - 최종 패키징 `.\gradlew.bat :desktop:test :desktop:installDist`: BUILD SUCCESSFUL, 테스트 24/24, `desktop/build/install/desktop/bin/offcon-desktop.exe` 16,961,536 bytes + `llama-server.exe` 11,371,008 bytes 스테이징 확인.
+- **참고**: 앱 완전 내장형 이미지 생성(stable-diffusion.cpp `sd-server` 엔진 번들링)은 다음 단계 과제로 남김.
