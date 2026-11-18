@@ -64,7 +64,7 @@ jobs:
             -DGGML_AVX2=ON
           cmake --build desktop/build/llama-cpp --config Release --target llama-server --parallel
 
-      - name: Package Windows Desktop Archive
+      - name: Package Windows Installer Wizard & Portable Archive
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist-win/OffconAI-desktop | Out-Null
@@ -73,13 +73,38 @@ jobs:
           if (!(Test-Path dist-win/OffconAI-desktop/offcon-desktop.exe)) { throw "Missing offcon-desktop.exe" }
           if (!(Test-Path dist-win/OffconAI-desktop/llama-server.exe)) { throw "Missing bundled llama-server.exe" }
           Compress-Archive -Path dist-win/OffconAI-desktop/* -DestinationPath OffconAI-desktop-windows-x86_64.zip -Force
-          Get-FileHash OffconAI-desktop-windows-x86_64.zip -Algorithm SHA256 | Format-List
+
+          $iscc = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            $iscc = @(
+              "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+              "C:\Program Files\Inno Setup 6\ISCC.exe",
+              "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $iscc) { throw "Inno Setup 6 (ISCC.exe) not found" }
+
+          $cargoToml = Get-Content desktop/Cargo.toml -Raw
+          $appVer = if ($cargoToml -match '(?m)^version\s*=\s*"([^"]+)"') { $Matches[1] } else { "2.3.1" }
+          $repoRoot = (Get-Location).Path
+          $distDir = Join-Path $repoRoot "dist-win\OffconAI-desktop"
+          & $iscc "/DAppVersion=$appVer" "/DRepoRoot=$repoRoot" "/DDistDir=$distDir" "/DOutputDir=$repoRoot" "desktop\installer\windows\offcon-desktop.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          if (!(Test-Path OffconAI-desktop-windows-x86_64-setup.exe)) { throw "Missing installer exe" }
+          Get-FileHash OffconAI-desktop-windows-x86_64-setup.exe, OffconAI-desktop-windows-x86_64.zip -Algorithm SHA256 | Format-List
 
       - name: Upload Windows Desktop Artifact
         uses: actions/upload-artifact@v7
         with:
           name: desktop-windows-x86_64
-          path: OffconAI-desktop-windows-x86_64.zip
+          path: |
+            OffconAI-desktop-windows-x86_64-setup.exe
+            OffconAI-desktop-windows-x86_64.zip
 
   release:
     name: Build Android APK & Linux Desktop & Publish
@@ -158,15 +183,39 @@ jobs:
           echo "=== APK Signature ==="
           $ANDROID_HOME/build-tools/36.0.0/apksigner verify --print-certs "$APK_FILE" || true
 
-      - name: Build Linux desktop distribution
+      - name: Build Linux desktop distribution & .deb package
         run: |
-          ./gradlew :desktop:installDist --stacktrace
+          ./gradlew :desktop:assemble --stacktrace
           test -x desktop/build/install/desktop/bin/offcon-desktop
           test -x desktop/build/install/desktop/bin/llama-server
-          cd desktop/build/install
-          zip -r "$GITHUB_WORKSPACE/OffconAI-desktop-linux-x86_64.zip" desktop
+          chmod +x desktop/build/install/desktop/install.sh desktop/build/install/desktop/uninstall.sh
+          (cd desktop/build/install && zip -r "$GITHUB_WORKSPACE/OffconAI-desktop-linux-x86_64.zip" desktop)
           cp "$GITHUB_WORKSPACE/OffconAI-desktop-linux-x86_64.zip" "$GITHUB_WORKSPACE/OffconAI-desktop.zip"
-          sha256sum "$GITHUB_WORKSPACE/OffconAI-desktop-linux-x86_64.zip"
+
+          APP_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' desktop/Cargo.toml | head -n1)
+          DEB_ROOT="$GITHUB_WORKSPACE/deb-pkg"
+          mkdir -p "$DEB_ROOT/DEBIAN" \
+            "$DEB_ROOT/opt/offconai-desktop/bin" \
+            "$DEB_ROOT/usr/bin" \
+            "$DEB_ROOT/usr/share/applications" \
+            "$DEB_ROOT/usr/share/icons/hicolor/256x256/apps"
+          install -m 0755 desktop/build/install/desktop/bin/offcon-desktop "$DEB_ROOT/opt/offconai-desktop/bin/offcon-desktop"
+          install -m 0755 desktop/build/install/desktop/bin/llama-server "$DEB_ROOT/opt/offconai-desktop/bin/llama-server"
+          ln -s /opt/offconai-desktop/bin/offcon-desktop "$DEB_ROOT/usr/bin/offcon-desktop"
+          sed 's|^Exec=.*|Exec=/usr/bin/offcon-desktop|' desktop/installer/linux/offconai-desktop.desktop \
+            > "$DEB_ROOT/usr/share/applications/offconai-desktop.desktop"
+          install -m 0644 desktop/assets/offcon.png "$DEB_ROOT/usr/share/icons/hicolor/256x256/apps/offconai-desktop.png"
+          printf '%s\n' \
+            "Package: offconai-desktop" \
+            "Version: ${APP_VER:-2.3.1}" \
+            "Section: utils" \
+            "Priority: optional" \
+            "Architecture: amd64" \
+            "Maintainer: OffconAI <noreply@offconai.local>" \
+            "Description: OffconAI Desktop - local-first AI workspace with bundled llama.cpp" \
+            > "$DEB_ROOT/DEBIAN/control"
+          dpkg-deb --build "$DEB_ROOT" "$GITHUB_WORKSPACE/OffconAI-desktop-linux-x86_64.deb"
+          sha256sum "$GITHUB_WORKSPACE/OffconAI-desktop-linux-x86_64.deb" "$GITHUB_WORKSPACE/OffconAI-desktop-linux-x86_64.zip"
 
       - name: Download Windows Desktop Artifact
         uses: actions/download-artifact@v7
@@ -188,7 +237,9 @@ jobs:
             echo "Release $TAG already exists. Uploading release assets..."
             gh release upload "$TAG" \
               app/build/outputs/apk/release/*.apk \
+              OffconAI-desktop-windows-x86_64-setup.exe \
               OffconAI-desktop-windows-x86_64.zip \
+              OffconAI-desktop-linux-x86_64.deb \
               OffconAI-desktop-linux-x86_64.zip \
               OffconAI-desktop.zip \
               --clobber
@@ -196,7 +247,9 @@ jobs:
             echo "Release $TAG does not exist. Creating new release with assets..."
             gh release create "$TAG" \
               app/build/outputs/apk/release/*.apk \
+              OffconAI-desktop-windows-x86_64-setup.exe \
               OffconAI-desktop-windows-x86_64.zip \
+              OffconAI-desktop-linux-x86_64.deb \
               OffconAI-desktop-linux-x86_64.zip \
               OffconAI-desktop.zip \
               --title "$TAG" \

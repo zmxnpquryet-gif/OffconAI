@@ -694,3 +694,20 @@
     - Desktop Rust 테스트: **34 passed, 0 failed, 1 ignored** (기존 24 + `epoch` 2 + `contracts` 1 + `session` 2 + `transport` 1 + `mcp` 2 + `image_backend` 1 + `persist` 1).
     - 스테이징: `desktop/build/install/desktop/bin/offcon-desktop.exe` (17,022,976 bytes) + `llama-server.exe` (11,371,008 bytes).
   - `.\gradlew.bat :app:assembleDebug`: **BUILD SUCCESSFUL** (arm64-v8a CMake 포함 APK 빌드 통과).
+
+## 2026-11-18 — 데스크탑 앱 설치형 전환 및 릴리즈 설치마법사 추가 (v2.3.1, main)
+
+- **배경**: 사용자 요청("그리고 데탑앱을 설치형으로 바꿔 릴리즈엔 설치마법사 주고")에 따라 Windows용 Inno Setup 6 설치마법사(`OffconAI-desktop-windows-x86_64-setup.exe`), 앱 아이콘 임베드, Linux 설치 스크립트/데스크탑 런처 및 `.deb` 패키징을 추가했다. (릴리즈 시 기존 포터블 zip도 호환용으로 함께 유지.)
+- **구현 내용**:
+  - `desktop/assets/offcon.ico`, `desktop/assets/offcon.png` (신규): `docs/assets/offcon-mark.svg` 기반으로 16/32/48/256px 다중 해상도 `.ico` 및 256px `.png` 아이콘 생성.
+  - `desktop/Cargo.toml` & `desktop/build.rs`: Windows 빌드 시 `winresource`를 통해 `offcon-desktop.exe`에 `offcon.ico`와 제품 메타데이터(`OffconAI Desktop`) 직접 임베드.
+  - `desktop/installer/windows/offcon-desktop.iss` (신규): Inno Setup 6 모던 설치 마법사. 영어/한국어 지원, 안정적 `AppId`로 인플레이스 업그레이드 지원, 기본 사용자 설치(`%LOCALAPPDATA%\Programs\OffconAI Desktop`, UAC 불필요) + 모든 사용자 설치(`Program Files`) 선택 가능, 시작 메뉴/바탕화면 바로가기, 번들 `llama-server.exe` 동시 설치, 실행 중 프로세스 자동 종료 안내, 완료 후 즉시 실행 옵션, 제거 시 `%LOCALAPPDATA%\OffconAI` 다운로드 모델/설정 보존 여부 확인 대화상자 포함.
+  - `desktop/installer/linux/{offconai-desktop.desktop,install.sh,uninstall.sh}` (신규): `~/.local` 기준 설치·제거 스크립트 및 앱 런처 아이콘 등록.
+  - `desktop/build.gradle.kts`: `:desktop:packageInstaller` (Inno Setup 6 호출 → `desktop/build/installer/OffconAI-desktop-windows-x86_64-setup.exe`) 및 `:desktop:stageLinuxInstallerExtras` 태스크 추가 (Gradle configuration cache 호환).
+  - `.github/workflows/release.yml`: `desktop-windows` 잡에서 `OffconAI-desktop-windows-x86_64-setup.exe` + 포터블 `OffconAI-desktop-windows-x86_64.zip` 동시 빌드·업로드, `release` 잡에서 Linux `OffconAI-desktop-linux-x86_64.deb`(`dpkg-deb`) 및 zip 빌드 후 모든 자산을 릴리즈에 게시.
+  - `docs/desktop.md`: 설치 마법사 빌드(`:desktop:packageInstaller`) 및 Linux 설치 안내 추가.
+  - 버전: desktop `2.3.1`, app `versionCode = 27` / `versionName = "2.3.1"`.
+- **검증**:
+  - 디스크 정리: `.arena/*` 내부 빌드 캐시 및 구 debug 타겟을 정리해 C: 여유 공간 30.65 GB 확보.
+  - `.\gradlew.bat :desktop:test :desktop:packageInstaller`: **BUILD SUCCESSFUL** — `OffconAI-desktop-windows-x86_64-setup.exe` (10,936,607 B), `offcon-desktop.exe` (17,035,776 B), `llama-server.exe` (11,371,008 B).
+  - 설치마법사 UI 스크린샷 확인(한국어 설치 모드 선택 창 + 커스텀 아이콘) 및 임시 경로 무인 설치(`/VERYSILENT /CURRENTUSER /DIR=...`) → 바이너리/언인스톨러 생성 확인 → `unins000.exe /VERYSILENT` 완전 제거(`remaining_after_uninstall=False`) 검증 완료.

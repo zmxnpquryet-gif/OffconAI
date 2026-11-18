@@ -116,8 +116,8 @@ android {
     applicationId = "com.localllm.android"
     minSdk = 24
     targetSdk = 36
-    versionCode = 26
-    versionName = "2.3.0"
+    versionCode = 27
+    versionName = "2.3.1"
     ndk { abiFilters.addAll(listOf("arm64-v8a", "x86_64")) }
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

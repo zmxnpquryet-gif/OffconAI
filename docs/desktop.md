@@ -17,9 +17,12 @@ Or through the root Gradle wrapper tasks:
 
 ```powershell
 .\gradlew.bat :desktop:test :desktop:installDist
+.\gradlew.bat :desktop:packageInstaller
 ```
 
 The release executable is produced at `desktop/target/release/offcon-desktop` (`.exe` on Windows) and staged into `desktop/build/install/desktop/bin/` alongside the bundled `llama-server` inference engine compiled from `app/src/main/cpp/llama.cpp` by `:desktop:installDist`.
+
+On Windows, `:desktop:packageInstaller` compiles the Inno Setup 6 installer wizard (`desktop/installer/windows/offcon-desktop.iss`) into `desktop/build/installer/OffconAI-desktop-windows-x86_64-setup.exe` with Start Menu / optional Desktop shortcuts, English & Korean wizard UI, per-user or all-users install mode, and an uninstaller that preserves downloaded models by default. On Linux, `desktop/installer/linux/` provides `install.sh`, `uninstall.sh`, and a `.desktop` entry (plus `.deb` packaging in releases).
 
 ## Architecture
 

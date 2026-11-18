@@ -93,6 +93,51 @@ val installDist = tasks.register<Copy>("installDist") {
   into(layout.buildDirectory.dir("install/desktop/bin"))
 }
 
+val stageLinuxInstallerExtras = tasks.register<Copy>("stageLinuxInstallerExtras") {
+  group = "distribution"
+  description = "Stages Linux install.sh, uninstall.sh, .desktop entry, and icon beside bin/."
+  dependsOn(installDist)
+  from(layout.projectDirectory.dir("installer/linux"))
+  from(layout.projectDirectory.file("assets/offcon.png"))
+  into(layout.buildDirectory.dir("install/desktop"))
+}
+
+val packageInstaller = tasks.register<Exec>("packageInstaller") {
+  group = "distribution"
+  description = "Builds the Windows installer wizard (OffconAI-desktop-windows-x86_64-setup.exe) via Inno Setup 6."
+  dependsOn(installDist)
+  val distDir = layout.buildDirectory.dir("install/desktop/bin").get().asFile
+  val outDir = layout.buildDirectory.dir("installer").get().asFile
+  val issFile = layout.projectDirectory.file("installer/windows/offcon-desktop.iss").asFile
+  val rootDirFile = rootProject.layout.projectDirectory.asFile
+  val cargoTomlFile = layout.projectDirectory.file("Cargo.toml").asFile
+  val localAppData = System.getenv("LOCALAPPDATA") ?: ""
+  val winPlatform = isWindows
+
+  doFirst {
+    require(winPlatform) { ":desktop:packageInstaller only runs on Windows." }
+    val candidates = listOf(
+      "C:\\Program Files (x86)\\Inno Setup 6\\ISCC.exe",
+      "C:\\Program Files\\Inno Setup 6\\ISCC.exe",
+      if (localAppData.isNotEmpty()) "$localAppData\\Programs\\Inno Setup 6\\ISCC.exe" else ""
+    ).filter { it.isNotEmpty() }.map { File(it) }
+    val iscc = candidates.firstOrNull { it.isFile }
+      ?: throw GradleException("Inno Setup 6 (ISCC.exe) was not found. Install via `winget install JRSoftware.InnoSetup`.")
+    val versionMatch = Regex("""(?m)^version\s*=\s*"([^"]+)"""").find(cargoTomlFile.readText())
+    val appVersion = versionMatch?.groupValues?.get(1) ?: "2.3.0"
+    outDir.mkdirs()
+    commandLine(
+      iscc.absolutePath,
+      "/DAppVersion=$appVersion",
+      "/DRepoRoot=${rootDirFile.absolutePath}",
+      "/DDistDir=${distDir.absolutePath}",
+      "/DOutputDir=${outDir.absolutePath}",
+      issFile.absolutePath,
+    )
+  }
+  commandLine("cmd", "/c", "echo", "preparing installer")
+}
+
 val runDesktop = tasks.register<Exec>("run") {
   group = "application"
   description = "Runs the Rust + Slint desktop workspace."
@@ -112,4 +157,7 @@ tasks.named("check") {
 
 tasks.named("assemble") {
   dependsOn(installDist)
+  if (!isWindows) {
+    dependsOn(stageLinuxInstallerExtras)
+  }
 }
