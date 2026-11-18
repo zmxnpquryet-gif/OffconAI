@@ -616,11 +616,16 @@
     <string name="doc_error_no_text">此文档中未找到可读文本</string>
     <string name="doc_ocr_partial">OCR 仅读取了 %2$d 页中的前 %1$d 页。</string>
     <string name="chat_library_title">从库中添加</string>
-    <string name="chat_library_hint">仅在此处开启的文件会在本对话中被检索。</string>
+    <string name="chat_library_hint">仅在此处开启的文件会在本对话中被检索。点击箭头可按文件展开查看详细片段。</string>
     <string name="chat_library_chunks">已索引 %1$d 个片段</string>
+    <string name="chat_library_chunks_toggle_expand">查看片段</string>
+    <string name="chat_library_chunks_toggle_collapse">收起片段</string>
+    <string name="chat_library_chunks_loading">正在加载片段…</string>
+    <string name="chat_library_chunk_header">#%1$d/%2$d · %3$d 字</string>
+    <string name="settings_documents_empty">尚无已索引文档。</string>
     <string name="chat_library_delete">从库中删除</string>
     <string name="chat_attach_document">附加文档和文本文件</string>
-    <string name="chat_attach_document_hint">索引 PDF、XLSX、PPTX 和文本文件以进行搜索</string>
+    <string name="chat_attach_document_hint">索引 PDF、DOCX、XLSX、PPTX 和文本文件以进行搜索</string>
     <string name="update_banner_title">有可用更新：%1$s</string>
     <string name="update_banner_engine">内置引擎：llama.cpp %1$s · LiteRT-LM %2$s</string>
     <string name="update_banner_action">查看</string>
@@ -674,7 +679,7 @@
     <string name="chat_state_expanded">已展开</string>
     <string name="chat_state_collapsed">已折叠</string>
     <string name="chat_attach_opening">正在打开选择器…</string>
-    <string name="chat_library_empty">库中还没有文档。附加 PDF、XLSX、PPTX 或文本文件即可在本对话中检索。</string>
+    <string name="chat_library_empty">库中还没有文档。附加 PDF、DOCX、XLSX、PPTX 或文本文件即可在本对话中检索。</string>
 
     <!-- Voice screen: native-audio facts, explicit states, microphone semantics -->
     <string name="voice_native_session_title">原生音频会话</string>

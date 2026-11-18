@@ -134,7 +134,7 @@ internal class ChatTurnRunner(
                 isStreaming = true
             )
             val history = McpToolProtocol.trimHistory(currentList.takeLast(HISTORY_WINDOW).map(::toHistoryPair))
-            val documentContext = conversations.buildDocumentContext(trimmed)
+            val documentContext = conversations.buildDocumentContext(trimmed, currentSettings().contextWindow)
 
             val previousJob = currentStreamJob
             previousJob?.cancel()

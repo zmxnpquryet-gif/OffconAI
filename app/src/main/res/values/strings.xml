@@ -616,11 +616,16 @@
     <string name="doc_error_no_text">No readable text was found in this document</string>
     <string name="doc_ocr_partial">OCR read the first %1$d of %2$d pages.</string>
     <string name="chat_library_title">Add from library</string>
-    <string name="chat_library_hint">Only files turned on here are searched in this chat.</string>
+    <string name="chat_library_hint">Only files turned on here are searched in this chat. Tap the arrow to inspect chunks per file.</string>
     <string name="chat_library_chunks">%1$d chunks indexed</string>
+    <string name="chat_library_chunks_toggle_expand">Show chunks</string>
+    <string name="chat_library_chunks_toggle_collapse">Hide chunks</string>
+    <string name="chat_library_chunks_loading">Loading chunks…</string>
+    <string name="chat_library_chunk_header">#%1$d/%2$d · %3$d chars</string>
+    <string name="settings_documents_empty">No documents indexed yet.</string>
     <string name="chat_library_delete">Remove from library</string>
     <string name="chat_attach_document">Attach Documents &amp; Text Files</string>
-    <string name="chat_attach_document_hint">Index PDF, XLSX, PPTX and text files for search</string>
+    <string name="chat_attach_document_hint">Index PDF, DOCX, XLSX, PPTX and text files for search</string>
     <string name="update_banner_title">Update available: %1$s</string>
     <string name="update_banner_engine">Bundled engines: llama.cpp %1$s · LiteRT-LM %2$s</string>
     <string name="update_banner_action">View</string>
@@ -674,7 +679,7 @@
     <string name="chat_state_expanded">Expanded</string>
     <string name="chat_state_collapsed">Collapsed</string>
     <string name="chat_attach_opening">Opening the picker…</string>
-    <string name="chat_library_empty">No documents in the library yet. Attach a PDF, XLSX, PPTX or text file to search it in this chat.</string>
+    <string name="chat_library_empty">No documents in the library yet. Attach a PDF, DOCX, XLSX, PPTX or text file to search it in this chat.</string>
 
     <!-- Voice screen: native-audio facts, explicit states, microphone semantics -->
     <string name="voice_native_session_title">Native audio session</string>

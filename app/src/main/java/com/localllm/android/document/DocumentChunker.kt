@@ -7,7 +7,8 @@ package com.localllm.android.document
  * sentence boundary first and a word boundary second, so a single huge cell or a
  * PDF page without blank lines cannot produce an unbounded chunk. Consecutive chunks
  * share up to [overlap] characters so an answer that straddles a boundary can still
- * be retrieved.
+ * be retrieved. Every boundary respects UTF-16 surrogate pairs so chunks never emit
+ * orphaned surrogates (which would corrupt UTF-8 passed across JNI to native engines).
  */
 object DocumentChunker {
     const val DEFAULT_MAX_CHARS = 900
@@ -42,7 +43,7 @@ object DocumentChunker {
             }
 
             chunks += current.toString().trim()
-            val tail = current.takeLast(overlap).trimStart()
+            val tail = safeTakeLast(current, overlap).trimStart()
             current.setLength(0)
             if (tail.isNotEmpty() && tail.length + 2 + paragraph.length <= maxChars) {
                 current.append(tail).append("\n\n").append(paragraph)
@@ -55,13 +56,43 @@ object DocumentChunker {
         return chunks.filter { it.isNotEmpty() }
     }
 
-    private fun normalize(text: String): String = text
-        .replace("\r\n", "\n")
-        .replace('\r', '\n')
-        .replace(Regex("[\\t\\u000B\\f]+"), " ")
-        .replace(Regex(" {2,}"), " ")
-        .replace(Regex("\\n{3,}"), "\n\n")
-        .trim()
+    internal fun normalize(text: String): String {
+        val cleaned = StringBuilder(text.length)
+        var i = 0
+        while (i < text.length) {
+            val c = text[i]
+            when {
+                Character.isHighSurrogate(c) -> {
+                    if (i + 1 < text.length && Character.isLowSurrogate(text[i + 1])) {
+                        cleaned.append(c).append(text[i + 1])
+                        i += 2
+                        continue
+                    }
+                }
+                Character.isLowSurrogate(c) -> { /* drop lone low surrogate */ }
+                c == '\uFEFF' || c == '\u00AD' || c == '\uFFFD' -> { /* strip BOM / soft-hyphen / replacement */ }
+                c == '\r' -> cleaned.append('\n')
+                c == '\n' -> cleaned.append('\n')
+                c == '\t' || c == '\u000B' || c == '\u000C' -> cleaned.append(' ')
+                c.code < 0x20 || c.code == 0x7F -> { /* strip control chars */ }
+                else -> cleaned.append(c)
+            }
+            i++
+        }
+        return cleaned.toString()
+            .replace(Regex(" {2,}"), " ")
+            .replace(Regex("\\n{3,}"), "\n\n")
+            .trim()
+    }
+
+    private fun safeTakeLast(sb: CharSequence, count: Int): String {
+        if (count <= 0 || sb.isEmpty()) return ""
+        var start = (sb.length - count).coerceAtLeast(0)
+        if (start > 0 && start < sb.length && Character.isLowSurrogate(sb[start])) {
+            start++
+        }
+        return sb.subSequence(start, sb.length).toString()
+    }
 
     private fun splitLongParagraph(paragraph: String, maxChars: Int): List<String> {
         if (paragraph.length <= maxChars) return listOf(paragraph)
@@ -71,8 +102,13 @@ object DocumentChunker {
             var cut = rest.lastIndexOf(". ", maxChars)
             if (cut < maxChars / 2) cut = rest.lastIndexOf("? ", maxChars)
             if (cut < maxChars / 2) cut = rest.lastIndexOf("! ", maxChars)
+            if (cut < maxChars / 2) cut = rest.lastIndexOf('\n', maxChars)
             if (cut < maxChars / 2) cut = rest.lastIndexOf(' ', maxChars)
             if (cut <= 0) cut = maxChars
+            if (cut > 0 && cut < rest.length && Character.isLowSurrogate(rest[cut])) {
+                cut--
+            }
+            if (cut <= 0) cut = minOf(maxChars, rest.length)
             pieces += rest.substring(0, cut).trim()
             rest = rest.substring(cut).trimStart()
         }

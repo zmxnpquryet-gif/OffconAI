@@ -54,6 +54,8 @@ fun SettingsScreen(
     val activeModel by viewModel.activeModel.collectAsStateWithLifecycle()
     val selectedToolTemplate by viewModel.selectedToolTemplateChoice.collectAsStateWithLifecycle()
     val documentStats by viewModel.documentStats.collectAsStateWithLifecycle()
+    val documentLibrary by viewModel.documentLibrary.collectAsStateWithLifecycle()
+    val documentChunksByDocId by viewModel.documentChunksByDocId.collectAsStateWithLifecycle()
 
     var showClearDialog by remember { mutableStateOf(false) }
     var showMemoryLog by remember { mutableStateOf(false) }
@@ -151,6 +153,10 @@ fun SettingsScreen(
                 DocumentsAndApiSections(
                     settings = settings,
                     documentStats = documentStats,
+                    documentLibrary = documentLibrary,
+                    documentChunksByDocId = documentChunksByDocId,
+                    onExpandDocumentChunks = viewModel::loadDocumentChunks,
+                    onDeleteDocument = viewModel::deleteIndexedDocument,
                     isApiModeEnabled = isApiModeEnabled,
                     apiPort = apiPort,
                     localIpAddress = localIpAddress,

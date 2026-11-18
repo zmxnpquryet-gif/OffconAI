@@ -616,11 +616,16 @@
     <string name="doc_error_no_text">이 문서에서 읽을 수 있는 텍스트를 찾지 못했습니다</string>
     <string name="doc_ocr_partial">전체 %2$d페이지 중 처음 %1$d페이지만 OCR로 읽었습니다.</string>
     <string name="chat_library_title">라이브러리에서 추가</string>
-    <string name="chat_library_hint">여기서 켠 파일만 이 대화에서 검색됩니다.</string>
+    <string name="chat_library_hint">여기서 켠 파일만 이 대화에서 검색됩니다. 화살표를 눌러 파일별 청크를 자세히 볼 수 있습니다.</string>
     <string name="chat_library_chunks">%1$d개 청크 인덱싱됨</string>
+    <string name="chat_library_chunks_toggle_expand">청크 보기</string>
+    <string name="chat_library_chunks_toggle_collapse">청크 접기</string>
+    <string name="chat_library_chunks_loading">청크 불러오는 중…</string>
+    <string name="chat_library_chunk_header">#%1$d/%2$d · %3$d자</string>
+    <string name="settings_documents_empty">아직 인덱싱된 문서가 없습니다.</string>
     <string name="chat_library_delete">라이브러리에서 삭제</string>
     <string name="chat_attach_document">문서 및 텍스트 파일 첨부</string>
-    <string name="chat_attach_document_hint">PDF, XLSX, PPTX, 텍스트 파일을 인덱싱해 검색합니다</string>
+    <string name="chat_attach_document_hint">PDF, DOCX, XLSX, PPTX, 텍스트 파일을 인덱싱해 검색합니다</string>
     <string name="update_banner_title">업데이트 있음: %1$s</string>
     <string name="update_banner_engine">내장 엔진: llama.cpp %1$s · LiteRT-LM %2$s</string>
     <string name="update_banner_action">보기</string>
@@ -674,7 +679,7 @@
     <string name="chat_state_expanded">펼쳐짐</string>
     <string name="chat_state_collapsed">접힘</string>
     <string name="chat_attach_opening">선택기를 여는 중…</string>
-    <string name="chat_library_empty">라이브러리에 문서가 없습니다. PDF, XLSX, PPTX 또는 텍스트 파일을 첨부하면 이 대화에서 검색할 수 있습니다.</string>
+    <string name="chat_library_empty">라이브러리에 문서가 없습니다. PDF, DOCX, XLSX, PPTX 또는 텍스트 파일을 첨부하면 이 대화에서 검색할 수 있습니다.</string>
 
     <!-- Voice screen: native-audio facts, explicit states, microphone semantics -->
     <string name="voice_native_session_title">네이티브 오디오 세션</string>

@@ -50,6 +50,23 @@ class OfficeTextParserTest {
     }
 
     @Test
+    fun `docx extracts paragraphs and breaks cleanly`() {
+        val bytes = zip(
+            "word/document.xml" to """
+                <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                  <w:body>
+                    <w:p><w:r><w:t>첫 번째 문단입니다.</w:t></w:r></w:p>
+                    <w:p><w:r><w:t>계약 금액</w:t><w:tab/><w:t>500만원</w:t></w:r></w:p>
+                  </w:body>
+                </w:document>
+            """.trimIndent()
+        )
+        val text = OfficeTextParser.parseDocx(bytes)
+        assertTrue(text, text.contains("첫 번째 문단입니다."))
+        assertTrue(text, text.contains("계약 금액 500만원"))
+    }
+
+    @Test
     fun `malformed xml does not throw`() {
         val bytes = zip("ppt/slides/slide1.xml" to "<a:t>broken")
         assertTrue(OfficeTextParser.parsePptx(bytes).isEmpty())

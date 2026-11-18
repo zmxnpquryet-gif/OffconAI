@@ -93,8 +93,10 @@ fun ChatInputBar(
     onOpenVoiceMode: () -> Unit,
     onDocumentPicked: (android.net.Uri, String) -> Unit = { _, _ -> },
     indexedDocuments: List<com.localllm.android.document.DocumentSummary> = emptyList(),
+    documentChunksByDocId: Map<String, List<com.localllm.android.document.DocumentChunkPreview>> = emptyMap(),
     activeDocumentIds: Set<String> = emptySet(),
     onToggleDocument: (String) -> Unit = {},
+    onExpandDocumentChunks: (String) -> Unit = {},
     onDeleteDocument: (String) -> Unit = {},
     isModelLoading: Boolean = false,
     modelLoadingProgress: Float = 0f,
@@ -631,70 +633,17 @@ fun ChatInputBar(
                 color = GlassTheme.colors.onSurfaceVariant
             )
         } else {
-            indexedDocuments.forEach { document ->
-                DocumentLibraryRow(
-                    name = document.name,
-                    chunks = document.chunks,
-                    included = document.id in activeDocumentIds,
-                    onToggle = { onToggleDocument(document.id) },
-                    onDelete = { onDeleteDocument(document.id) }
-                )
-            }
+            DocumentLibraryGroupedList(
+                documents = indexedDocuments,
+                chunksByDocId = documentChunksByDocId,
+                onExpandDocument = onExpandDocumentChunks,
+                onDeleteDocument = onDeleteDocument,
+                activeDocumentIds = activeDocumentIds,
+                onToggleDocument = onToggleDocument
+            )
         }
 
         Spacer(modifier = Modifier.height(8.dp))
-    }
-}
-
-/**
- * One indexed document.
- *
- * The row is the single toggleable node (Role.Switch) and the trailing [GSwitch] is a
- * non-interactive indicator, so the row tap and the switch never fight over the same tap.
- * The delete action stays a separate 48dp button with its own label, and the file name
- * ellipsizes inside the weighted column instead of pushing the controls off-screen.
- */
-@Composable
-private fun DocumentLibraryRow(
-    name: String,
-    chunks: Int,
-    included: Boolean,
-    onToggle: () -> Unit,
-    onDelete: () -> Unit
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .toggleable(value = included, role = Role.Switch, onValueChange = { onToggle() })
-            .padding(start = 8.dp, end = 2.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            GText(
-                text = name,
-                style = GlassTheme.type.bodyMedium,
-                color = GlassTheme.colors.onSurface,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            GText(
-                text = stringResource(R.string.chat_library_chunks, chunks),
-                style = GlassTheme.type.labelSmall,
-                color = GlassTheme.colors.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-        }
-        GCompactIconButton(onClick = onDelete) {
-            GIcon(
-                imageVector = GIcons.Close,
-                contentDescription = stringResource(R.string.chat_library_delete),
-                tint = GlassTheme.colors.onSurfaceVariant,
-                modifier = Modifier.size(15.dp)
-            )
-        }
-        GSwitch(checked = included, onCheckedChange = null)
     }
 }
 

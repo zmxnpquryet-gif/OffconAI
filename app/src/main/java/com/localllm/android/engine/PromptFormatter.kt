@@ -41,7 +41,8 @@ object PromptFormatter {
                 } else if (includeBuiltInSystemPrompt) {
                     append(AppStrings.get(R.string.sys_prompt))
                 }
-                append("\n\n").append(AppStrings.get(R.string.sys_doc_header)).append("\n")
+                if (isNotEmpty()) append("\n\n")
+                append(AppStrings.get(R.string.sys_doc_header)).append("\n")
                 append(documentBlock)
             }
         }

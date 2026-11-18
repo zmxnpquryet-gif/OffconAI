@@ -28,4 +28,23 @@ class DocumentChunkerTest {
         assertTrue(DocumentChunker.chunk(" \n\n\t ").isEmpty())
         assertTrue(DocumentChunker.chunk("").isEmpty())
     }
+
+    @Test
+    fun `surrogate pairs and control characters never corrupt chunk boundaries`() {
+        val emojis = "안녕😊".repeat(120)
+        val chunks = DocumentChunker.chunk("\uFEFF$emojis\u0000\uFFFD", maxChars = 51, overlap = 11)
+        assertTrue(chunks.isNotEmpty())
+        chunks.forEach { chunk ->
+            assertTrue("unexpected replacement/BOM/nul", !chunk.contains('\uFFFD') && !chunk.contains('\uFEFF') && !chunk.contains('\u0000'))
+            for (i in chunk.indices) {
+                val c = chunk[i]
+                if (Character.isHighSurrogate(c)) {
+                    assertTrue("unpaired high surrogate at $i", i + 1 < chunk.length && Character.isLowSurrogate(chunk[i + 1]))
+                }
+                if (Character.isLowSurrogate(c)) {
+                    assertTrue("unpaired low surrogate at $i", i > 0 && Character.isHighSurrogate(chunk[i - 1]))
+                }
+            }
+        }
+    }
 }

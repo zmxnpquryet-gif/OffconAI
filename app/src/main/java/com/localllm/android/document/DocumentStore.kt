@@ -146,7 +146,7 @@ class DocumentStore(context: Context) : SQLiteOpenHelper(
     fun listDocuments(): List<DocumentSummary> {
         val result = mutableListOf<DocumentSummary>()
         readableDatabase.rawQuery(
-            "SELECT doc_id, doc_name, COUNT(*) FROM $TABLE GROUP BY doc_id, doc_name ORDER BY MAX(id) DESC",
+            "SELECT doc_id, MAX(doc_name), COUNT(*) FROM $TABLE GROUP BY doc_id ORDER BY MAX(id) DESC",
             null
         ).use { cursor ->
             while (cursor.moveToNext()) {
@@ -158,6 +158,38 @@ class DocumentStore(context: Context) : SQLiteOpenHelper(
                     "document"
                 }
                 result += DocumentSummary(docId, name, cursor.getInt(2))
+            }
+        }
+        return result
+    }
+
+    /** Decrypts and returns every chunk stored for [docId] in original order for inspection. */
+    fun chunksForDocument(docId: String): List<DocumentChunkPreview> {
+        val result = mutableListOf<DocumentChunkPreview>()
+        readableDatabase.query(
+            TABLE,
+            arrayOf("ordinal", "total", "text"),
+            "doc_id = ?",
+            arrayOf(docId),
+            null,
+            null,
+            "ordinal ASC"
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                val ordinal = cursor.getInt(0)
+                val total = cursor.getInt(1)
+                val cipher = cursor.getString(2)
+                val text = try {
+                    ChatCrypto.decrypt(cipher, aad(docId, ordinal))
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Unreadable chunk $ordinal for $docId", t)
+                    "[undecryptable chunk]"
+                }
+                result += DocumentChunkPreview(
+                    ordinal = ordinal,
+                    total = total,
+                    text = text
+                )
             }
         }
         return result
@@ -212,6 +244,13 @@ data class DocumentSummary(
     val id: String,
     val name: String,
     val chunks: Int
+)
+
+/** One decrypted chunk belonging to an indexed document, shown in the file dropdown. */
+data class DocumentChunkPreview(
+    val ordinal: Int,
+    val total: Int,
+    val text: String
 )
 
 /** Index statistics shown in Settings. */

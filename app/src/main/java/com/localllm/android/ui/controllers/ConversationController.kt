@@ -6,6 +6,7 @@ import android.net.Uri
 import android.util.Log
 import com.localllm.android.R
 import com.localllm.android.data.repository.ChatRepository
+import com.localllm.android.document.DocumentChunkPreview
 import com.localllm.android.document.DocumentIndex
 import com.localllm.android.document.DocumentStats
 import com.localllm.android.document.DocumentSummary
@@ -67,6 +68,9 @@ internal class ConversationController(
 
     private val _documentLibrary = MutableStateFlow<List<DocumentSummary>>(emptyList())
     val documentLibrary: StateFlow<List<DocumentSummary>> = _documentLibrary.asStateFlow()
+
+    private val _documentChunksByDocId = MutableStateFlow<Map<String, List<DocumentChunkPreview>>>(emptyMap())
+    val documentChunksByDocId: StateFlow<Map<String, List<DocumentChunkPreview>>> = _documentChunksByDocId.asStateFlow()
 
     fun initialize() {
         scope.launch {
@@ -179,8 +183,29 @@ internal class ConversationController(
         return attachment
     }
 
-    suspend fun buildDocumentContext(query: String): String? =
-        runCatching { documentIndex.buildContext(query, _activeDocumentIds.value) }.getOrNull()
+    suspend fun buildDocumentContext(query: String, contextWindow: Int = 4096): String? {
+        val (maxChunks, maxChars) = when {
+            contextWindow <= 2048 -> 2 to 1200
+            contextWindow <= 4096 -> 3 to 2400
+            else -> 4 to 3800
+        }
+        return runCatching {
+            documentIndex.buildContext(
+                query = query,
+                documentIds = _activeDocumentIds.value,
+                maxChunks = maxChunks,
+                maxChars = maxChars
+            )
+        }.getOrNull()
+    }
+
+    fun loadDocumentChunks(documentId: String, forceRefresh: Boolean = false) {
+        if (!forceRefresh && _documentChunksByDocId.value.containsKey(documentId)) return
+        scope.launch {
+            val chunks = runCatching { documentIndex.chunksForDocument(documentId) }.getOrNull() ?: return@launch
+            _documentChunksByDocId.value = _documentChunksByDocId.value + (documentId to chunks)
+        }
+    }
 
     fun importDocument(uri: Uri, displayName: String) {
         scope.launch {
@@ -191,7 +216,11 @@ internal class ConversationController(
             _documentStats.value = documentIndex.stats()
             _documentLibrary.value = documentIndex.documents()
             result.onSuccess { ingested ->
-                if (ingested.chunkCount > 0) enableDocumentForCurrentChat(ingested.documentId)
+                _documentChunksByDocId.value = _documentChunksByDocId.value - ingested.documentId
+                if (ingested.chunkCount > 0) {
+                    enableDocumentForCurrentChat(ingested.documentId)
+                    loadDocumentChunks(ingested.documentId, forceRefresh = true)
+                }
             }
             postStatus(
                 result.fold(
@@ -223,6 +252,7 @@ internal class ConversationController(
         scope.launch {
             runCatching { documentIndex.deleteDocument(documentId) }
             pruneDocumentFromSelections(documentId)
+            _documentChunksByDocId.value = _documentChunksByDocId.value - documentId
             _documentLibrary.value = documentIndex.documents()
             _documentStats.value = documentIndex.stats()
             postStatus(strings.get(R.string.vm_doc_deleted, name))
@@ -235,6 +265,7 @@ internal class ConversationController(
             documentSelectionPrefs.edit().clear().apply()
             _activeDocumentIds.value = emptySet()
             _documentLibrary.value = emptyList()
+            _documentChunksByDocId.value = emptyMap()
             _documentStats.value = documentIndex.stats()
             postStatus(strings.get(R.string.vm_doc_cleared))
         }

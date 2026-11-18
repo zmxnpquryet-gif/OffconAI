@@ -28,8 +28,13 @@ class HashedTextEmbedder(private val dimensions: Int = DEFAULT_DIMENSIONS) {
         for (match in WORD_PATTERN.findAll(normalized)) {
             val word = match.value
             add(vector, word, 1.0f)
-            // Character trigrams: Korean particles and CJK compounds rarely split on
-            // spaces, so whole-word matches alone would miss most morphology.
+            // Character bigrams + trigrams: 2-char Korean nouns (e.g. 계약, 요약, 가격)
+            // and CJK compounds would otherwise miss word-level matching entirely.
+            if (word.length >= 2) {
+                for (i in 0..word.length - 2) {
+                    add(vector, word.substring(i, i + 2), 0.4f)
+                }
+            }
             if (word.length >= 3) {
                 for (i in 0..word.length - 3) {
                     add(vector, word.substring(i, i + 3), 0.5f)

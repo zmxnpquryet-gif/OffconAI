@@ -9,20 +9,71 @@ import javax.xml.parsers.DocumentBuilder
 import javax.xml.parsers.DocumentBuilderFactory
 
 /**
- * Extracts readable text from OOXML packages (`.xlsx`, `.pptx`) without any Office
- * SDK: both formats are zip archives of XML parts. Each part is parsed with a
+ * Extracts readable text from OOXML packages (`.docx`, `.xlsx`, `.pptx`) without any Office
+ * SDK: all three formats are zip archives of XML parts. Each part is parsed with a
  * hardened [DocumentBuilder] (DOCTYPE disabled) and entity expansion off, because a
  * downloaded document is untrusted input.
  *
- * Output is plain text with sheet/slide markers, which is what the chunker and the
- * model consume. Formatting, formulas and charts are out of scope; cached cell
- * values and slide text are what is kept.
+ * Output is plain text with paragraph/sheet/slide markers, which is what the chunker and
+ * the model consume. Formatting, formulas and charts are out of scope; cached cell values,
+ * document paragraphs, and slide text are kept.
  */
 object OfficeTextParser {
 
     private const val MAX_ENTRY_BYTES = 8 * 1024 * 1024
     private const val MAX_TOTAL_BYTES = 40 * 1024 * 1024
     private const val MAX_ENTRIES = 2000
+
+    fun parseDocx(bytes: ByteArray): String {
+        val entries = readEntries(bytes) { name ->
+            name == "word/document.xml" ||
+                name.matches(Regex("word/(header|footer)\\d+\\.xml")) ||
+                name == "word/footnotes.xml"
+        }
+        if (entries.isEmpty()) return ""
+
+        val orderedKeys = buildList {
+            if ("word/document.xml" in entries) add("word/document.xml")
+            entries.keys.filter { it.startsWith("word/header") }.sortedBy { numberIn(it) }.forEach(::add)
+            entries.keys.filter { it.startsWith("word/footer") }.sortedBy { numberIn(it) }.forEach(::add)
+            if ("word/footnotes.xml" in entries) add("word/footnotes.xml")
+        }
+
+        val paragraphs = mutableListOf<String>()
+        for (key in orderedKeys) {
+            val doc = parse(entries.getValue(key)) ?: continue
+            val pNodes = doc.getElementsByTagName("w:p")
+            val targetNodes = if (pNodes.length > 0) pNodes else doc.getElementsByTagName("p")
+            if (targetNodes.length == 0) {
+                val text = doc.documentElement?.textContent?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
+                if (text.isNotEmpty()) paragraphs += text
+                continue
+            }
+            for (i in 0 until targetNodes.length) {
+                val p = targetNodes.item(i) as? Element ?: continue
+                val sb = StringBuilder()
+                collectDocxParagraphText(p, sb)
+                val line = sb.toString().replace(Regex(" {2,}"), " ").trim()
+                if (line.isNotEmpty()) paragraphs += line
+            }
+        }
+        return paragraphs.joinToString("\n\n").trim()
+    }
+
+    private fun collectDocxParagraphText(node: org.w3c.dom.Node, out: StringBuilder) {
+        val name = node.nodeName
+        when {
+            name == "w:t" || name == "t" || name == "w:delText" -> out.append(node.textContent ?: "")
+            name == "w:tab" || name == "tab" -> out.append(' ')
+            name == "w:br" || name == "br" || name == "w:cr" -> out.append('\n')
+            else -> {
+                val children = node.childNodes
+                for (i in 0 until children.length) {
+                    collectDocxParagraphText(children.item(i), out)
+                }
+            }
+        }
+    }
 
     fun parseXlsx(bytes: ByteArray): String {
         val entries = readEntries(bytes) { name ->

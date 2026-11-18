@@ -78,6 +78,7 @@ fun ChatScreen(
     val isApiModeEnabled by viewModel.isApiModeEnabled.collectAsStateWithLifecycle()
     val apiPort by viewModel.apiServerPort.collectAsStateWithLifecycle()
     val documentLibrary by viewModel.documentLibrary.collectAsStateWithLifecycle()
+    val documentChunksByDocId by viewModel.documentChunksByDocId.collectAsStateWithLifecycle()
     val activeDocumentIds by viewModel.activeDocumentIds.collectAsStateWithLifecycle()
     val appUpdate by viewModel.appUpdate.collectAsStateWithLifecycle()
     val pendingTool by viewModel.pendingToolApproval.collectAsStateWithLifecycle()
@@ -275,8 +276,10 @@ fun ChatScreen(
                             onOpenVoiceMode = { viewModel.navigateTo(AppScreen.VOICE_MODE) },
                             onDocumentPicked = viewModel::importDocument,
                             indexedDocuments = documentLibrary,
+                            documentChunksByDocId = documentChunksByDocId,
                             activeDocumentIds = activeDocumentIds,
                             onToggleDocument = viewModel::toggleDocumentSelection,
+                            onExpandDocumentChunks = viewModel::loadDocumentChunks,
                             onDeleteDocument = viewModel::deleteIndexedDocument,
                             isModelLoading = isModelLoading,
                             modelLoadingProgress = modelLoadingProgress,

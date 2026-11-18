@@ -711,3 +711,21 @@
   - 디스크 정리: `.arena/*` 내부 빌드 캐시 및 구 debug 타겟을 정리해 C: 여유 공간 30.65 GB 확보.
   - `.\gradlew.bat :desktop:test :desktop:packageInstaller`: **BUILD SUCCESSFUL** — `OffconAI-desktop-windows-x86_64-setup.exe` (10,936,607 B), `offcon-desktop.exe` (17,035,776 B), `llama-server.exe` (11,371,008 B).
   - 설치마법사 UI 스크린샷 확인(한국어 설치 모드 선택 창 + 커스텀 아이콘) 및 임시 경로 무인 설치(`/VERYSILENT /CURRENTUSER /DIR=...`) → 바이너리/언인스톨러 생성 확인 → `unins000.exe /VERYSILENT` 완전 제거(`remaining_after_uninstall=False`) 검증 완료.
+
+## 2026-11-18 — Android 파일 인덱싱·RAG 파이프라인 전면 수정 + 파일별 청크 드롭다운 상세 보기 (v2.3.2, main)
+
+- **원인 진단**: 사용자 보고("파일 인덱싱 다 깨진다 RAG 다 깨짐 그리고 파일별로 청크 묶어줘 드롭다운으로 세세하게 보도록", "화면이 안 깨지고 모델이 받는 게 깨짐")를 추적해 4가지 근본 원인을 확인했다.
+  1. `DocumentTextExtractor`: UTF-8 단일 디코딩이라 CP949/EUC-KR(한글 텍스트/CSV)이나 UTF-16LE/BE 파일이 `\uFFFD`()로 깨지거나 NUL 바이트 때문에 바이너리 파일 오류로 거부됐고, `.docx`는 파서 없이 `readText`로 빠져 ZIP 바이너리가 인덱싱/거부됐다.
+  2. `DocumentChunker`: 900자/오버랩 경계에서 UTF-16 서로게이트 쌍이 반토막 날 수 있고 제어문자·`\uFFFD`·`\uFEFF`·`\u00AD`가 그대로 남아 JNI `jstring_to_utf8`을 통해 모델 입력을 오염시킬 수 있었다.
+  3. `HashedTextEmbedder` & `DocumentIndex`: 2글자 한국어 단어(`계약`, `요약`, `금액` 등)가 3-gram에서 누락되고 900자 청크의 L2 norm(~20) 때문에 정확 키워드도 `MIN_SIMILARITY(0.08f)` 미만으로 탈락했으며, `"이 파일 요약해줘"` 같은 일반 질문은 겹치는 단어가 없어 `buildContext`가 `null`을 반환(모델에 문서 내용이 전혀 전달되지 않음). 반대로 4,000자 고정 상한은 `n_ctx=2048` 등 작은 컨텍스트 모델에서 `STATUS_CONTEXT_OVERFLOW`를 유발했다.
+  4. UI 가시성 부재: 첨부 시트·설정 화면 모두 파일당 청크 개수만 표시되어 실제 추출·저장된 청크를 확인할 방법이 없었다.
+- **수정 내용**:
+  - `OfficeTextParser.kt`: `parseDocx` 추가(`word/document.xml`, header/footer/footnotes 문단·탭·줄바꿈 추출) 및 `OfficeTextParserTest.kt` 테스트 추가.
+  - `DocumentTextExtractor.kt`: BOM(UTF-8/UTF-16LE/BE) + BOM 없는 UTF-16 휴리스틱 + 엄격 UTF-8 검증 후 `x-windows-949`(MS949/EUC-KR)/`GB18030` 등 폴백 디코딩 및 바이너리 차단 추가, `.docx`/`.html`/`.htm` 지원 추가.
+  - `DocumentChunker.kt`: 서로게이트 쌍 경계 보존(`safeTakeLast`·분할 위치 보정) 및 제어문자·`\uFFFD`·`\uFEFF`·`\u00AD` 제거 + `DocumentChunkerTest.kt` 테스트 추가.
+  - `HashedTextEmbedder.kt` & `DocumentIndex.kt` & `PromptFormatter.kt` & `ChatTurnRunner.kt`: 2-gram 지원 추가, 선택 문서의 첫 청크(`ordinal < 2`)를 항상 후보에 포함해 복호화 후 정확한 키워드/부분문자열 하이브리드 재랭킹 적용, 키워드 미일치 요약 질문 시 선택 문서별 라운드로빈 오프닝 청크 폴백 보장, `settings.contextWindow`에 맞춘 RAG 예산(`<=2048 -> 1200자`, `<=4096 -> 2400자`, `>=8192 -> 3800자`) 적용, `PromptFormatter` 빈 시스템 프롬프트 선행 개행 정리. `DocumentIndexTest.kt` 신규 추가.
+  - `DocumentStore.kt`, `ConversationController.kt`, `MainViewModel.kt`, `DocumentLibraryComponents.kt`(신규), `ChatInputBar.kt`, `ChatScreen.kt`, `SettingsIntegrationSections.kt`, `SettingsScreen.kt`, `strings.xml`(EN/KO/ZH): 파일별 청크 온디맨드 조회(`chunksForDocument`)와 파일별 그룹 카드 + 펼치기/접기 드롭다운(`#1/N · 글자수`, 청크 탭 시 전문 펼침)을 채팅 첨부 시트 및 설정 화면 양쪽에 구현.
+  - 버전: desktop `2.3.2`, app `versionCode = 28` / `versionName = "2.3.2"`.
+- **검증**:
+  - `.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug`: **BUILD SUCCESSFUL** — Android 단위 테스트 **51 suites, 357 tests, 0 failures, 0 errors, 0 skipped** (신규 인코딩/DOCX/서로게이트/RAG 검색·폴백 테스트 6건 + `StringResourceParityTest` 포함).
+  - `.\gradlew.bat :desktop:test :desktop:packageInstaller`: **BUILD SUCCESSFUL** (`2.3.2` 재패키징 확인).

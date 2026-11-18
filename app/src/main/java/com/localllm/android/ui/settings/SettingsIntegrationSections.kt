@@ -35,11 +35,14 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.localllm.android.R
+import com.localllm.android.document.DocumentChunkPreview
 import com.localllm.android.document.DocumentStats
+import com.localllm.android.document.DocumentSummary
 import com.localllm.android.engine.McpTool
 import com.localllm.android.model.GenerationSettings
 import com.localllm.android.model.LlmModel
 import com.localllm.android.model.ToolCallTemplate
+import com.localllm.android.ui.chat.DocumentLibraryGroupedList
 import com.localllm.android.ui.glass.GButton
 import com.localllm.android.ui.glass.GFilterChip
 import com.localllm.android.ui.glass.GIcon
@@ -445,6 +448,10 @@ internal fun ThemeAndLanguageSections(
 internal fun DocumentsAndApiSections(
     settings: GenerationSettings,
     documentStats: DocumentStats,
+    documentLibrary: List<DocumentSummary>,
+    documentChunksByDocId: Map<String, List<DocumentChunkPreview>>,
+    onExpandDocumentChunks: (String) -> Unit,
+    onDeleteDocument: (String) -> Unit,
     isApiModeEnabled: Boolean,
     apiPort: Int,
     localIpAddress: String,
@@ -463,8 +470,24 @@ internal fun DocumentsAndApiSections(
             style = GlassTheme.type.bodySmall,
             color = GlassTheme.colors.onSurfaceVariant
         )
+        if (documentLibrary.isEmpty()) {
+            Spacer(modifier = Modifier.height(6.dp))
+            GText(
+                text = stringResource(R.string.settings_documents_empty),
+                style = GlassTheme.type.labelSmall,
+                color = GlassTheme.colors.onSurfaceVariant
+            )
+        } else {
+            Spacer(modifier = Modifier.height(10.dp))
+            DocumentLibraryGroupedList(
+                documents = documentLibrary,
+                chunksByDocId = documentChunksByDocId,
+                onExpandDocument = onExpandDocumentChunks,
+                onDeleteDocument = onDeleteDocument
+            )
+        }
         if (documentStats.chunks > 0) {
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(10.dp))
             GButton(onClick = onClearDocuments) {
                 GText(stringResource(R.string.settings_documents_clear))
             }

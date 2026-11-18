@@ -12,6 +12,7 @@ import com.localllm.android.data.ModelStorageManager
 import com.localllm.android.data.local.ChatDatabase
 import com.localllm.android.data.preferences.AppSettingsStore
 import com.localllm.android.data.repository.ChatRepository
+import com.localllm.android.document.DocumentChunkPreview
 import com.localllm.android.document.DocumentStats
 import com.localllm.android.document.DocumentSummary
 import com.localllm.android.engine.DownloadStatus
@@ -214,6 +215,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val documentStats: StateFlow<DocumentStats> get() = conversationController.documentStats
     val activeDocumentIds: StateFlow<Set<String>> get() = conversationController.activeDocumentIds
     val documentLibrary: StateFlow<List<DocumentSummary>> get() = conversationController.documentLibrary
+    val documentChunksByDocId: StateFlow<Map<String, List<DocumentChunkPreview>>>
+        get() = conversationController.documentChunksByDocId
 
     val models: StateFlow<List<LlmModel>> get() = modelController.models
     val activeModel: StateFlow<LlmModel?> get() = modelController.activeModel
@@ -281,6 +284,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setPendingAttachment(attachment: ChatAttachment?) = conversationController.setPendingAttachment(attachment)
     fun importDocument(uri: Uri, displayName: String) = conversationController.importDocument(uri, displayName)
     fun toggleDocumentSelection(documentId: String) = conversationController.toggleDocumentSelection(documentId)
+    fun loadDocumentChunks(documentId: String) = conversationController.loadDocumentChunks(documentId)
     fun deleteIndexedDocument(documentId: String) = conversationController.deleteIndexedDocument(documentId)
     fun clearDocumentIndex() = conversationController.clearDocumentIndex()
 
