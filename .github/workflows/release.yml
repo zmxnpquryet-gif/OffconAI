@@ -218,7 +218,7 @@ jobs:
           sha256sum "$GITHUB_WORKSPACE/OffconAI-desktop-linux-x86_64.deb" "$GITHUB_WORKSPACE/OffconAI-desktop-linux-x86_64.zip"
 
       - name: Download Windows Desktop Artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: desktop-windows-x86_64
           path: ${{ github.workspace }}
